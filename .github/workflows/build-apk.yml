@@ -9,29 +9,26 @@ jobs:
   build:
     name: Build APK on Ubuntu
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
 
     steps:
-      - name: 1. 檢出專案程式碼
+      - name: 檢出專案程式碼
         uses: actions/checkout@v4
 
-      - name: 2. 配置 Java 17 環境
+      - name: 配置 Java 17 環境
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
 
-      - name: 3. 安裝與執行 Gradle 打包
+      - name: 安裝相容版 Gradle 8.5
         uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.5"
 
-      - name: 4. 初始化 Gradle Wrapper 並編譯 APK
-        run: |
-          gradle wrapper
-          chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
+      - name: 編譯 Debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
 
-      - name: 5. 上傳編譯產出的 APK 安裝檔
+      - name: 上傳編譯產出的 APK 安裝檔
         uses: actions/upload-artifact@v4
         with:
           name: AutoAdCloser-App
