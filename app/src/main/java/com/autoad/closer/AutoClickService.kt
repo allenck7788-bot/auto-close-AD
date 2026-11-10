@@ -14,12 +14,15 @@ class AutoClickService : AccessibilityService() {
 
     companion object {
         var instance: AutoClickService? = null
+        private const val CLICK_COOLDOWN_MS = 3000L // 嚴格限制：3 秒內最多只觸發一次點擊
     }
+
+    private var lastClickTime = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
-        showToast("AutoAdCloser 服務已在背景啟動")
+        showToast("AutoAdCloser 已啟動 (已設定 3 秒安全偵測)")
     }
 
     override fun onDestroy() {
@@ -30,6 +33,12 @@ class AutoClickService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
 
+        // 時間節流檢查：若距離上次點擊未滿 3 秒，直接略過，不執行任何掃描
+        val currentTime = System.currentTimeMillis()
+        if (currentTime - lastClickTime < CLICK_COOLDOWN_MS) {
+            return
+        }
+
         try {
             val root = rootInActiveWindow ?: event.source ?: return
             scanAndClickNodes(root)
@@ -39,6 +48,9 @@ class AutoClickService : AccessibilityService() {
     override fun onInterrupt() {}
 
     private fun scanAndClickNodes(node: AccessibilityNodeInfo) {
+        val currentTime = System.currentTimeMillis()
+        if (currentTime - lastClickTime < CLICK_COOLDOWN_MS) return
+
         val closeKeywords = listOf(
             "關閉", "跳過", "關閉廣告", "跳過廣告", 
             "Close", "close", "SKIP", "Skip", "skip", 
@@ -46,11 +58,12 @@ class AutoClickService : AccessibilityService() {
         )
 
         val text = node.text?.toString()?.trim() ?: ""
-        val desc = node.contentDescription?.toString() ?: ""
+        val desc = node.contentDescription?.toString()?.trim() ?: ""
 
         for (kw in closeKeywords) {
             if (text == kw || desc == kw || (kw.length > 1 && (text.contains(kw) || desc.contains(kw)))) {
                 if (performClickOnNode(node)) {
+                    lastClickTime = System.currentTimeMillis() // 鎖定時間戳記
                     showToast("⚡ 已自動點擊：$kw")
                     return
                 }
@@ -60,6 +73,7 @@ class AutoClickService : AccessibilityService() {
         val viewId = node.viewIdResourceName?.lowercase() ?: ""
         if (viewId.contains("close") || viewId.contains("btn_skip") || viewId.contains("dismiss")) {
             if (performClickOnNode(node)) {
+                lastClickTime = System.currentTimeMillis() // 鎖定時間戳記
                 showToast("⚡ 已點擊廣告關閉按鈕")
                 return
             }
@@ -67,6 +81,7 @@ class AutoClickService : AccessibilityService() {
 
         for (i in 0 until node.childCount) {
             try {
+                if (System.currentTimeMillis() - lastClickTime < CLICK_COOLDOWN_MS) return
                 node.getChild(i)?.let { scanAndClickNodes(it) }
             } catch (_: Exception) {}
         }
