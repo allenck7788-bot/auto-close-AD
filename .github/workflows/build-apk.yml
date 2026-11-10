@@ -1,35 +1,194 @@
-name: Build Android APK
+package com.autoad.closer
 
-on:
-  push:
-    branches: [ "main" ]
-  workflow_dispatch:
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Path
+import android.graphics.PointF
+import android.os.Build
+import android.util.DisplayMetrics
+import android.view.WindowManager
+import android.view.accessibility.AccessibilityEvent
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import org.opencv.android.Utils
+import org.opencv.core.Core
+import org.opencv.core.Mat
+import org.opencv.core.Point
+import org.opencv.core.Rect
+import org.opencv.core.Size
+import org.opencv.imgproc.Imgproc
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-    - name: Checkout Source Code
-      uses: actions/checkout@v4
+class AutoClickService : AccessibilityService() {
 
-    - name: Set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        distribution: 'temurin'
-        java-version: '17'
+    companion object {
+        var instance: AutoClickService? = null
+    }
 
-    - name: Setup Gradle
-      uses: gradle/actions/setup-gradle@v3
+    private val serviceScope = CoroutineScope(Dispatchers.Default + Job())
+    private var isScanning = false
+    private val scanIntervalMs = 1500L
 
-    - name: Grant execute permission for gradlew
-      run: chmod +x gradlew
+    // 內建關閉按鈕模板（灰階）
+    var localTemplateMat: Mat? = null
 
-    - name: Build Debug APK
-      run: ./gradlew assembleDebug --stacktrace
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        instance = this
+    }
 
-    - name: Upload APK Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: AutoCloseAd-Debug-APK
-        path: app/build/outputs/apk/debug/*.apk
-        retention-days: 7
+    override fun onDestroy() {
+        super.onDestroy()
+        isScanning = false
+        instance = null
+        localTemplateMat?.release()
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        // 監聽到視窗切換（例如廣告跳出）時，可選擇觸發檢查
+    }
+
+    override fun onInterrupt() {}
+
+    /**
+     * 動態取得即時螢幕寬高（自動適應直向、橫向、手機或平板）
+     */
+    fun getScreenSize(): Pair<Int, Int> {
+        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = wm.currentWindowMetrics.bounds
+            Pair(bounds.width(), bounds.height())
+        } else {
+            val dm = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getRealMetrics(dm)
+            Pair(dm.widthPixels, dm.heightPixels)
+        }
+    }
+
+    /**
+     * 依照螢幕解析度動態計算感興趣區域 (ROI)
+     * 掃描範圍限制在左右上角的頂部區塊，節省計算開銷
+     */
+    private fun getDynamicScanRegions(screenWidth: Int, screenHeight: Int): List<Rect> {
+        val cornerWidth = (screenWidth * 0.25).toInt()
+        val cornerHeight = (screenHeight * 0.18).toInt()
+
+        return listOf(
+            Rect(screenWidth - cornerWidth, 0, cornerWidth, cornerHeight), // 右上角
+            Rect(0, 0, cornerWidth, cornerHeight)                          // 左上角
+        )
+    }
+
+    /**
+     * 多尺度比對：在畫面局部搜尋模板，支援不同解析度比例縮放
+     */
+    fun scanForCloseButtonLocally(screenBitmap: Bitmap): PointF? {
+        val template = localTemplateMat ?: return null
+        val (screenWidth, screenHeight) = getScreenSize()
+
+        val screenMat = Mat()
+        Utils.bitmapToMat(screenBitmap, screenMat)
+
+        val grayScreen = Mat()
+        Imgproc.cvtColor(screenMat, grayScreen, Imgproc.COLOR_BGR2GRAY)
+        screenMat.release()
+
+        val rois = getDynamicScanRegions(screenWidth, screenHeight)
+        val scales = listOf(0.75, 1.0, 1.25, 1.5, 1.8) // 支援手機到大平板的尺寸縮放
+
+        for (roi in rois) {
+            // 防邊界溢出檢查
+            if (roi.x + roi.width > grayScreen.cols() || roi.y + roi.height > grayScreen.rows()) continue
+
+            val subMat = Mat(grayScreen, roi)
+
+            for (scale in scales) {
+                val newWidth = (template.cols() * scale).toInt()
+                val newHeight = (template.rows() * scale).toInt()
+
+                // 若縮放尺寸大於 ROI 則跳過
+                if (newWidth >= subMat.cols() || newHeight >= subMat.rows() || newWidth <= 0 || newHeight <= 0) {
+                    continue
+                }
+
+                val resizedTemplate = Mat()
+                Imgproc.resize(template, resizedTemplate, Size(newWidth.toDouble(), newHeight.toDouble()))
+
+                val result = Mat()
+                Imgproc.matchTemplate(subMat, resizedTemplate, result, Imgproc.TM_CCOEFF_NORMED)
+                val mmr = Core.minMaxLoc(result)
+
+                val isMatched = mmr.maxVal >= 0.82 // 相似度門檻
+
+                if (isMatched) {
+                    val localCenterPoint = Point(
+                        mmr.maxLoc.x + newWidth / 2.0,
+                        mmr.maxLoc.y + newHeight / 2.0
+                    )
+
+                    // 釋放局部記憶體
+                    resizedTemplate.release()
+                    result.release()
+                    subMat.release()
+                    grayScreen.release()
+
+                    // 計算回傳螢幕全域絕對座標
+                    return PointF(
+                        (roi.x + localCenterPoint.x).toFloat(),
+                        (roi.y + localCenterPoint.y).toFloat()
+                    )
+                }
+
+                resizedTemplate.release()
+                result.release()
+            }
+            subMat.release()
+        }
+
+        grayScreen.release()
+        return null
+    }
+
+    /**
+     * 執行無障礙手勢模擬點擊
+     */
+    fun clickAt(x: Float, y: Float) {
+        val path = Path().apply { moveTo(x, y) }
+        val stroke = GestureDescription.StrokeDescription(path, 0, 50)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        dispatchGesture(gesture, null, null)
+    }
+
+    /**
+     * 啟動背景定時掃描循環
+     */
+    fun startAutoScan(captureFrameProvider: () -> Bitmap?) {
+        if (isScanning) return
+        isScanning = true
+
+        serviceScope.launch {
+            while (isScanning) {
+                val bitmap = captureFrameProvider()
+                if (bitmap != null) {
+                    val targetPoint = scanForCloseButtonLocally(bitmap)
+                    bitmap.recycle()
+
+                    if (targetPoint != null) {
+                        clickAt(targetPoint.x, targetPoint.y)
+                        delay(3000L) // 點擊後等待廣告退出，避免重覆誤點
+                    }
+                }
+                delay(scanIntervalMs)
+            }
+        }
+    }
+
+    fun stopAutoScan() {
+        isScanning = false
+    }
+}
