@@ -1,23 +1,39 @@
 name: Build Android APK
 
 on:
+  workflow_dispatch:
   push:
     branches: [ "main" ]
-  workflow_dispatch:
 
 jobs:
   build:
+    name: Build APK on Ubuntu
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
     steps:
-      - name: 取得原始碼
+      - name: 1. 檢出專案程式碼
         uses: actions/checkout@v4
 
-      - name: 安裝 Java 17
+      - name: 2. 配置 Java 17 環境
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: '17'
+          distribution: temurin
+          java-version: 17
 
-      - name: 建立測試輸出 (確認語法正常)
-        run: echo "GitHub Actions 語法已修正成功！"
-concurrency: 
+      - name: 3. 安裝與執行 Gradle 打包
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 4. 初始化 Gradle Wrapper 並編譯 APK
+        run: |
+          gradle wrapper
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: 5. 上傳編譯產出的 APK 安裝檔
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoAdCloser-App
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
