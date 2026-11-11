@@ -136,12 +136,12 @@ class AutoClickService : AccessibilityService() {
         // =========================================================
         for (r in roots) {
             if (checkAndHandleCachingScreen(r)) {
-                return // 已成功處理快取畫面，直接結束本輪動作
+                return
             }
         }
 
         // =========================================================
-        // 【一般廣告精準比對】：只有抓到關閉按鈕才會點擊
+        // 【純精準比對，絕不盲點】：只有抓到明確關閉按鈕才會點擊
         // =========================================================
         for (r in roots) {
             if (scanAndClickNodes(r)) {
@@ -165,7 +165,7 @@ class AutoClickService : AccessibilityService() {
             return true
         }
 
-        // 2. 若箭頭按鈕為純圖片無文字/ID，則點擊左上角返回實體按鈕精準座標
+        // 2. 若箭頭按鈕為純圖片無文字/ID，點擊左上角返回實體座標
         clickTopLeftBackButton()
         return true
     }
@@ -177,129 +177,3 @@ class AutoClickService : AccessibilityService() {
             return true
         }
         for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            if (hasTextKeyword(child, keyword)) return true
-        }
-        return false
-    }
-
-    private fun findAndClickBackButton(node: AccessibilityNodeInfo): Boolean {
-        val text = node.text?.toString()?.trim() ?: ""
-        val desc = node.contentDescription?.toString()?.trim() ?: ""
-        val viewId = node.viewIdResourceName?.lowercase() ?: ""
-
-        val isBackKey = text == "←" || desc == "←" ||
-                desc.contains("返回", ignoreCase = true) ||
-                desc.contains("navigate up", ignoreCase = true) ||
-                desc.contains("back", ignoreCase = true) ||
-                viewId.contains("back") || viewId.contains("up")
-
-        if (isBackKey) {
-            val rect = Rect()
-            node.getBoundsInScreen(rect)
-            // 確保該元件位於螢幕左上半部（避免誤點底部的返回或不相關元件）
-            if (rect.centerX() < 300 && rect.centerY() < 400) {
-                if (performGestureClick(node)) return true
-            }
-        }
-
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            if (findAndClickBackButton(child)) return true
-        }
-        return false
-    }
-
-    /**
-     * 點擊頂部導航列左上角 ← 實體熱區 (比例約 X: 7.5%, Y: 4.8%)
-     */
-    private fun clickTopLeftBackButton() {
-        val (width, height) = getRealScreenSize()
-        if (width <= 0 || height <= 0) return
-
-        val isLandscape = width > height
-        val backX = if (isLandscape) width * 0.05f else width * 0.075f
-        val backY = if (isLandscape) height * 0.06f else height * 0.048f
-
-        val path = Path().apply { moveTo(backX, backY) }
-        val stroke = GestureDescription.StrokeDescription(path, 0, 50)
-        val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        dispatchGesture(gesture, null, null)
-    }
-
-    private fun isSafeScreen(node: AccessibilityNodeInfo): Boolean {
-        val text = node.text?.toString() ?: ""
-        val desc = node.contentDescription?.toString() ?: ""
-        val pkg = node.packageName?.toString()?.lowercase() ?: ""
-
-        if (text.contains("AutoAdCloser", ignoreCase = true) || 
-            desc.contains("AutoAdCloser", ignoreCase = true) ||
-            pkg.contains("settings")) {
-            return true
-        }
-
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            if (isSafeScreen(child)) return true
-        }
-        return false
-    }
-
-    private fun scanAndClickNodes(node: AccessibilityNodeInfo): Boolean {
-        val text = node.text?.toString()?.trim() ?: ""
-        val desc = node.contentDescription?.toString()?.trim() ?: ""
-        val viewId = node.viewIdResourceName?.lowercase() ?: ""
-
-        for (pattern in CLOSE_PATTERNS) {
-            if (isMatchingPattern(text, pattern) || isMatchingPattern(desc, pattern)) {
-                if (performGestureClick(node)) {
-                    showAlwaysToast("⚡ 點擊關閉按鈕：$pattern")
-                    return true
-                }
-            }
-        }
-
-        if (viewId.contains("close") || viewId.contains("skip") || viewId.contains("dismiss")) {
-            if (performGestureClick(node)) {
-                showAlwaysToast("⚡ 點擊關閉元件")
-                return true
-            }
-        }
-
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            if (scanAndClickNodes(child)) return true
-        }
-        return false
-    }
-
-    private fun isMatchingPattern(source: String, pattern: String): Boolean {
-        if (source.isEmpty()) return false
-        return if (pattern.length == 1) {
-            source.contains(pattern)
-        } else {
-            source.equals(pattern, ignoreCase = true) || source.contains(pattern, ignoreCase = true)
-        }
-    }
-
-    private fun performGestureClick(node: AccessibilityNodeInfo): Boolean {
-        val rect = Rect()
-        node.getBoundsInScreen(rect)
-
-        if (rect.width() in 10..450 && rect.height() in 10..450) {
-            val path = Path().apply { moveTo(rect.centerX().toFloat(), rect.centerY().toFloat()) }
-            val stroke = GestureDescription.StrokeDescription(path, 0, 50)
-            val gesture = GestureDescription.Builder().addStroke(stroke).build()
-            dispatchGesture(gesture, null, null)
-            return true
-        }
-        return false
-    }
-
-    private fun getRealScreenSize(): Pair<Int, Int> {
-        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val bounds = wm.currentWindowMetrics.bounds
-            Pair(bounds.width(), bounds.height())
-        } else {
-            val dm
