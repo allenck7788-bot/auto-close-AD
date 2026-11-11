@@ -40,7 +40,7 @@ class AutoClickService : AccessibilityService() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isServiceRunning = false
-    private var isActionPending = false // 防重入標記
+    private var isActionPending = false
     private var audioManager: AudioManager? = null
     private var windowManager: WindowManager? = null
 
@@ -52,18 +52,20 @@ class AutoClickService : AccessibilityService() {
         "Close", "close", "SKIP", "Skip", "skip"
     )
 
+    // 廣告卡片識別特徵（用來確保畫面確為廣告，絕不盲點）
+    private val AD_INDICATORS = listOf(
+        "Unity Ads", "unity ads", "廣告", "免費", "立即領取", "安裝", "立即安裝", "下載", "PLAY NOW", "Play Now"
+    )
+
     private val inspectionRunnable = object : Runnable {
         override fun run() {
             if (!isServiceRunning) return
 
-            // 1. 每輪巡檢前強制彈出提示
             showAlwaysToast("🔍 正在偵測廣告中...")
 
             try {
-                // 2. 踢醒系統視窗事件流
                 wakeUpSystemPipeline()
 
-                // 3. 執行依螢幕比例精準比對
                 if (!isActionPending) {
                     processScreenAction()
                 }
@@ -137,12 +139,28 @@ class AutoClickService : AccessibilityService() {
         }
 
         // =========================================================
-        // 【純精準比對，絕不盲點】：以全螢幕比例尋找實體關閉按鈕
+        // 【第一軌：純精準元件特徵比對】
         // =========================================================
         for (r in roots) {
             if (scanAndClickNodes(r)) {
+                return
+            }
+        }
+
+        // =========================================================
+        // 【第二軌：廣告畫面確立下的右上角叉叉精準命中】
+        // 嚴格檢驗：畫面必須出現明確廣告標籤（如 Unity Ads/安裝/免費）才啟動
+        // =========================================================
+        var isAdScreen = false
+        for (r in roots) {
+            if (hasAnyAdIndicator(r)) {
+                isAdScreen = true
                 break
             }
+        }
+
+        if (isAdScreen) {
+            handleVerifiedAdTopRightClose()
         }
     }
 
@@ -174,5 +192,285 @@ class AutoClickService : AccessibilityService() {
         return false
     }
 
+    private fun hasAnyAdIndicator(node: AccessibilityNodeInfo): Boolean {
+        val text = node.text?.toString() ?: ""
+        val desc = node.contentDescription?.toString() ?: ""
+        for (indicator in AD_INDICATORS) {
+            if (text.contains(indicator, ignoreCase = true) || desc.contains(indicator, ignoreCase = true)) {
+                return true
+            }
+        }
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            if (hasAnyAdIndicator(child)) return true
+        }
+        return false
+    }
+
     private fun findAndClickBackButton(node: AccessibilityNodeInfo): Boolean {
-        val text = node.
+        val text = node.text?.toString()?.trim() ?: ""
+        val desc = node.contentDescription?.toString()?.trim() ?: ""
+        val viewId = node.viewIdResourceName?.lowercase() ?: ""
+
+        val isBackKey = text == "←" || desc == "←" ||
+                desc.contains("返回", ignoreCase = true) ||
+                desc.contains("navigate up", ignoreCase = true) ||
+                desc.contains("back", ignoreCase = true) ||
+                viewId.contains("back") || viewId.contains("up")
+
+        if (isBackKey) {
+            val rect = Rect()
+            node.getBoundsInScreen(rect)
+            if (rect.centerX() < 300 && rect.centerY() < 400) {
+                if (performGestureClick(node)) return true
+            }
+        }
+
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            if (findAndClickBackButton(child)) return true
+        }
+        return false
+    }
+
+    private fun clickTopLeftBackButton() {
+        val (width, height) = getRealScreenSize()
+        if (width <= 0 || height <= 0) return
+
+        val isLandscape = width > height
+        val backX = if (isLandscape) width * 0.05f else width * 0.075f
+        val backY = if (isLandscape) height * 0.06f else height * 0.048f
+
+        val path = Path().apply { moveTo(backX, backY) }
+        val stroke = GestureDescription.StrokeDescription(path, 0L, 50L)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        dispatchGesture(gesture, null, null)
+    }
+
+    private fun isSafeScreen(node: AccessibilityNodeInfo): Boolean {
+        val text = node.text?.toString() ?: ""
+        val desc = node.contentDescription?.toString() ?: ""
+        val pkg = node.packageName?.toString()?.lowercase() ?: ""
+
+        if (text.contains("AutoAdCloser", ignoreCase = true) || 
+            desc.contains("AutoAdCloser", ignoreCase = true)) {
+            return true
+        }
+
+        for (safe in SYSTEM_SAFE_PACKAGES) {
+            if (pkg.contains(safe)) {
+                return true
+            }
+        }
+
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            if (isSafeScreen(child)) return true
+        }
+        return false
+    }
+
+    private fun scanAndClickNodes(node: AccessibilityNodeInfo): Boolean {
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        val (screenWidth, screenHeight) = getRealScreenSize()
+
+        if (screenWidth <= 0 || screenHeight <= 0) return false
+
+        // 排除頂部導航列中右功能區 (Y < 12%, X 在 50%~85% 之間)
+        val isInTopNavBarFunctionZone = rect.centerY() < screenHeight * 0.12f &&
+                rect.centerX() > screenWidth * 0.50f && rect.centerX() < screenWidth * 0.85f
+        if (isInTopNavBarFunctionZone) {
+            return false
+        }
+
+        val text = node.text?.toString()?.trim() ?: ""
+        val desc = node.contentDescription?.toString()?.trim() ?: ""
+        val viewId = node.viewIdResourceName?.lowercase() ?: ""
+
+        // 1. 文字與符號比對
+        for (pattern in CLOSE_PATTERNS) {
+            if (isMatchingPattern(text, pattern) || isMatchingPattern(desc, pattern)) {
+                if (performGestureClick(node)) {
+                    showAlwaysToast("⚡ 點擊關閉按鈕：$pattern")
+                    return true
+                }
+            }
+        }
+
+        // 2. 元件 ID 比對
+        if (viewId.contains("close") || viewId.contains("skip") || viewId.contains("dismiss")) {
+            if (performGestureClick(node)) {
+                showAlwaysToast("⚡ 點擊關閉元件")
+                return true
+            }
+        }
+
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            if (scanAndClickNodes(child)) return true
+        }
+        return false
+    }
+
+    /**
+     * 當確定為廣告卡片畫面時，精準鎖定右上角叉叉
+     */
+    private fun handleVerifiedAdTopRightClose() {
+        val (screenWidth, screenHeight) = getRealScreenSize()
+        if (screenWidth <= 0 || screenHeight <= 0) return
+
+        // Unity Ads 右上角叉叉精準標準座標 (X: 89%, Y: 9.5%)
+        val targetX = screenWidth * 0.89f
+        val targetY = screenHeight * 0.095f
+
+        val targetRect = Rect(
+            (targetX - 45).toInt(),
+            (targetY - 45).toInt(),
+            (targetX + 45).toInt(),
+            (targetY + 45).toInt()
+        )
+
+        if (isDebugModeEnabled()) {
+            isActionPending = true
+            showDebugMarkerUnderButton(targetRect, 3500L)
+            showAlwaysToast("🛠️ 除錯中：鎖定廣告右上角叉叉，3 秒後點擊...")
+
+            mainHandler.postDelayed({
+                dispatchClick(targetX, targetY)
+                isActionPending = false
+            }, 3000L)
+        } else {
+            showAlwaysToast("⚡ 關閉廣告卡片")
+            dispatchClick(targetX, targetY)
+        }
+    }
+
+    private fun isMatchingPattern(source: String, pattern: String): Boolean {
+        if (source.isEmpty()) return false
+        return if (pattern.length == 1) {
+            source.contains(pattern)
+        } else {
+            source.equals(pattern, ignoreCase = true) || source.contains(pattern, ignoreCase = true)
+        }
+    }
+
+    private fun performGestureClick(node: AccessibilityNodeInfo): Boolean {
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+
+        val (screenWidth, screenHeight) = getRealScreenSize()
+        if (screenWidth <= 0 || screenHeight <= 0) return false
+
+        if (rect.width() > screenWidth * 0.5f && rect.height() > screenHeight * 0.5f) {
+            return false
+        }
+
+        val clickX = rect.centerX().toFloat()
+        val clickY = rect.centerY().toFloat()
+
+        if (isDebugModeEnabled()) {
+            isActionPending = true
+            showDebugMarkerUnderButton(rect, 3500L)
+            showAlwaysToast("🛠️ 除錯中：已鎖定按鈕，3 秒後執行點擊...")
+
+            mainHandler.postDelayed({
+                dispatchClick(clickX, clickY)
+                isActionPending = false
+            }, 3000L)
+        } else {
+            dispatchClick(clickX, clickY)
+        }
+        return true
+    }
+
+    private fun dispatchClick(x: Float, y: Float) {
+        val path = Path().apply { moveTo(x, y) }
+        val stroke = GestureDescription.StrokeDescription(path, 0L, 50L)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        dispatchGesture(gesture, null, null)
+    }
+
+    private fun isDebugModeEnabled(): Boolean {
+        val sp = getSharedPreferences("autoad_prefs", Context.MODE_PRIVATE)
+        return sp.getBoolean("debug_mode", false)
+    }
+
+    private fun showDebugMarkerUnderButton(buttonRect: Rect, displayDurationMs: Long = 1500L) {
+        mainHandler.post {
+            val wm = windowManager ?: return@post
+            try {
+                val markView = TextView(applicationContext).apply {
+                    text = "▲ 關閉！"
+                    setTextColor(Color.WHITE)
+                    textSize = 12f
+                    setBackgroundColor(Color.parseColor("#E53935"))
+                    setPadding(12, 4, 12, 4)
+                }
+
+                markView.measure(
+                    View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+                    View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+                )
+                val markWidth = markView.measuredWidth
+
+                val (screenWidth, _) = getRealScreenSize()
+
+                var targetX = buttonRect.centerX() - (markWidth / 2)
+                if (screenWidth > 0) {
+                    targetX = targetX.coerceIn(8, screenWidth - markWidth - 8)
+                }
+
+                val targetY = buttonRect.bottom + 2
+
+                val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+                } else {
+                    @Suppress("DEPRECATION")
+                    WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
+                }
+
+                val params = WindowManager.LayoutParams(
+                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    layoutType,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                    PixelFormat.TRANSLUCENT
+                ).apply {
+                    gravity = Gravity.TOP or Gravity.START
+                    x = targetX
+                    y = targetY
+                }
+
+                wm.addView(markView, params)
+
+                mainHandler.postDelayed({
+                    try {
+                        wm.removeView(markView)
+                    } catch (_: Exception) {}
+                }, displayDurationMs)
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun getRealScreenSize(): Pair<Int, Int> {
+        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = wm.currentWindowMetrics.bounds
+            Pair(bounds.width(), bounds.height())
+        } else {
+            val dm = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getRealMetrics(dm)
+            Pair(dm.widthPixels, dm.heightPixels)
+        }
+    }
+
+    private fun showAlwaysToast(msg: String) {
+        mainHandler.post {
+            try {
+                Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show()
+            } catch (_: Exception) {}
+        }
+    }
+}
