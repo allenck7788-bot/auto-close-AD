@@ -233,7 +233,7 @@ class AutoClickService : AccessibilityService() {
         val desc = node.contentDescription?.toString()?.trim() ?: ""
         val viewId = node.viewIdResourceName?.lowercase() ?: ""
 
-        // 1. 文字比對
+        // 1. 文字與符號比對
         for (pattern in CLOSE_PATTERNS) {
             if (isMatchingPattern(text, pattern) || isMatchingPattern(desc, pattern)) {
                 if (performGestureClick(node)) {
@@ -251,13 +251,14 @@ class AutoClickService : AccessibilityService() {
             }
         }
 
-        // 3. 純圖片 Unity Ads 卡片角落叉叉比對
+        // 3. 純圖片 Unity Ads 卡片角落叉叉精準辨識 (高解析度寬高 20px..280px，位於頂部兩側角落無長篇文字的元件)
         if (screenWidth > 0 && screenHeight > 0) {
-            val isSmallButton = rect.width() in 20..180 && rect.height() in 20..180
+            val isSmallButton = rect.width() in 20..280 && rect.height() in 20..280
             val isEdgeCorner = rect.top < screenHeight * 0.18f &&
-                    (rect.right > screenWidth * 0.86f || rect.left < screenWidth * 0.14f)
+                    (rect.right > screenWidth * 0.82f || rect.left < screenWidth * 0.18f)
+            val hasNoLongText = text.length < 5 && desc.length < 5
 
-            if (isSmallButton && isEdgeCorner && node.isClickable) {
+            if (isSmallButton && isEdgeCorner && hasNoLongText) {
                 if (performGestureClick(node)) {
                     showAlwaysToast("⚡ 精準點擊角落關閉元件")
                     return true
@@ -286,7 +287,6 @@ class AutoClickService : AccessibilityService() {
         node.getBoundsInScreen(rect)
 
         if (rect.width() in 10..450 && rect.height() in 10..450) {
-            // 檢查是否開啟除錯模式：若有，在按鈕下方標記「關閉！」
             if (isDebugModeEnabled()) {
                 showDebugMarkerUnderButton(rect)
             }
@@ -300,17 +300,11 @@ class AutoClickService : AccessibilityService() {
         return false
     }
 
-    /**
-     * 讀取使用者的除錯開關狀態
-     */
     private fun isDebugModeEnabled(): Boolean {
         val sp = getSharedPreferences("autoad_prefs", Context.MODE_PRIVATE)
         return sp.getBoolean("debug_mode", false)
     }
 
-    /**
-     * 除錯模式專用：在偵測到的按鈕正下方即時覆蓋紅底白字「關閉！」提示（截圖排查用）
-     */
     private fun showDebugMarkerUnderButton(buttonRect: Rect) {
         mainHandler.post {
             val wm = windowManager ?: return@post
@@ -319,7 +313,7 @@ class AutoClickService : AccessibilityService() {
                     text = "▼ 關閉！"
                     setTextColor(Color.WHITE)
                     textSize = 14f
-                    setBackgroundColor(Color.parseColor("#E53935")) // 亮紅底色
+                    setBackgroundColor(Color.parseColor("#E53935"))
                     setPadding(14, 6, 14, 6)
                 }
 
@@ -338,14 +332,12 @@ class AutoClickService : AccessibilityService() {
                     PixelFormat.TRANSLUCENT
                 ).apply {
                     gravity = Gravity.TOP or Gravity.START
-                    // 放置在按鈕中心水平對齊、垂直正下方
                     x = (buttonRect.centerX() - 70).coerceAtLeast(10)
                     y = buttonRect.bottom + 8
                 }
 
                 wm.addView(markView, params)
 
-                // 顯示 1.5 秒後自動移除，方便拍照截圖
                 mainHandler.postDelayed({
                     try {
                         wm.removeView(markView)
