@@ -19,8 +19,9 @@ class AutoClickService : AccessibilityService() {
 
     companion object {
         var instance: AutoClickService? = null
-        private const val CHECK_INTERVAL_MS = 4000L // 嚴格每 4 秒定時跳出並執行
+        private const val CHECK_INTERVAL_MS = 4000L // 每 4 秒定時巡檢
 
+        // 系統安全黑名單：桌面、設定、鍵盤不執行點擊
         private val SYSTEM_SAFE_PACKAGES = listOf(
             "settings",
             "launcher",
@@ -47,13 +48,13 @@ class AutoClickService : AccessibilityService() {
             if (!isServiceRunning) return
 
             try {
-                // 1. 保證第一順位：無條件強制彈出偵測提示！
+                // 1. 每 4 秒保證先彈出偵測提示
                 showToast("🔍 正在偵測廣告中...")
 
-                // 2. 音量微震盪喚醒系統視窗管線
+                // 2. 音量微震盪保活喚醒系統事件
                 triggerVolumeWakeup()
 
-                // 3. 執行關閉動作
+                // 3. 執行關閉流程
                 processScreenAction()
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -125,7 +126,6 @@ class AutoClickService : AccessibilityService() {
         }
 
         if (roots.isEmpty()) {
-            // 就算節點樹被廣告商遮蔽拿不到，也無條件盲點角落熱區
             triggerAllCornerHotspots()
             return
         }
@@ -137,7 +137,7 @@ class AutoClickService : AccessibilityService() {
             }
         }
 
-        // 1. 優先掃描節點
+        // 1. 優先掃描節點文字與元件 ID
         var clicked = false
         for (r in roots) {
             if (scanAndClickNodes(r)) {
@@ -146,7 +146,7 @@ class AutoClickService : AccessibilityService() {
             }
         }
 
-        // 2. 無文字按鈕時執行多點熱區補刀
+        // 2. 無文字按鈕時執行多點熱區手勢補刀
         if (!clicked) {
             triggerAllCornerHotspots()
         }
@@ -217,4 +217,57 @@ class AutoClickService : AccessibilityService() {
         node.getBoundsInScreen(rect)
 
         if (rect.width() in 10..450 && rect.height() in 10..450) {
-            clickAt(rect.centerX().toFloat(),
+            clickAt(rect.centerX().toFloat(), rect.centerY().toFloat())
+            return true
+        }
+        return false
+    }
+
+    private fun triggerAllCornerHotspots() {
+        val (width, height) = getRealScreenSize()
+        if (width <= 0 || height <= 0) return
+
+        val isLandscape = width > height
+
+        val extremeRightX = if (isLandscape) width * 0.945f else width * 0.938f
+        val extremeLeftX  = if (isLandscape) width * 0.055f else width * 0.062f
+        val innerRightX   = if (isLandscape) width * 0.900f else width * 0.835f
+        val innerLeftX    = if (isLandscape) width * 0.100f else width * 0.165f
+        val topY          = if (isLandscape) height * 0.080f else height * 0.068f
+
+        clickAt(extremeRightX, topY)
+        mainHandler.postDelayed({ clickAt(innerRightX, topY) }, 200L)
+        mainHandler.postDelayed({ clickAt(extremeLeftX, topY) }, 400L)
+        mainHandler.postDelayed({ clickAt(innerLeftX, topY) }, 600L)
+    }
+
+    private fun clickAt(x: Float, y: Float) {
+        val path = Path().apply { moveTo(x, y) }
+        val stroke = GestureDescription.StrokeDescription(path, 0, 50)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        dispatchGesture(gesture, null, null)
+    }
+
+    private fun getRealScreenSize(): Pair<Int, Int> {
+        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = wm.currentWindowMetrics.bounds
+            Pair(bounds.width(), bounds.height())
+        } else {
+            val dm = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getRealMetrics(dm)
+            Pair(dm.widthPixels, dm.heightPixels)
+        }
+    }
+
+    private fun showToast(msg: String) {
+        mainHandler.post {
+            try {
+                currentToast?.cancel()
+                currentToast = Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT)
+                currentToast?.show()
+            } catch (_: Exception) {}
+        }
+    }
+}
