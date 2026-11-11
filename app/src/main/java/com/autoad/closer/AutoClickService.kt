@@ -3,6 +3,7 @@ package com.autoad.closer
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.content.Context
+import android.content.Intent
 import android.graphics.Color
 import android.graphics.Path
 import android.graphics.PixelFormat
@@ -24,9 +25,9 @@ class AutoClickService : AccessibilityService() {
 
     companion object {
         var instance: AutoClickService? = null
-        private const val CHECK_INTERVAL_MS = 3500L // 3.5 秒定時巡檢
+        private const val CHECK_INTERVAL_MS = 3500L // 每 3.5 秒定時巡檢
 
-        // 系統安全清單
+        // 系統安全清單：設定、輸入法不點擊
         private val SYSTEM_SAFE_PACKAGES = listOf(
             "settings",
             "inputmethod",
@@ -52,22 +53,21 @@ class AutoClickService : AccessibilityService() {
         override fun run() {
             if (!isServiceRunning) return
 
-            // 1. 固定提示正在偵測
             showAlwaysToast("🔍 正在偵測廣告中...")
 
             try {
-                // 2. 針對完全不動的靜態畫面，發送系統級無感事件強制喚醒無障礙快取
                 wakeUpSystemPipeline()
 
-                // 3. 執行精確比對
                 if (!isActionPending) {
                     processScreenAction()
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
             } finally {
-                mainHandler.removeCallbacks(this)
-                mainHandler.postDelayed(this, CHECK_INTERVAL_MS)
+                if (isServiceRunning) {
+                    mainHandler.removeCallbacks(this)
+                    mainHandler.postDelayed(this, CHECK_INTERVAL_MS)
+                }
             }
         }
     }
@@ -76,35 +76,46 @@ class AutoClickService : AccessibilityService() {
         super.onServiceConnected()
         instance = this
         isServiceRunning = true
+        isActionPending = false
         audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         windowManager = getSystemService(Context.WINDOW_SERVICE) as? WindowManager
 
         showAlwaysToast("AutoAdCloser 服務已連線！")
 
-        mainHandler.removeCallbacks(inspectionRunnable)
+        mainHandler.removeCallbacksAndMessages(null)
         mainHandler.postDelayed(inspectionRunnable, 1000L)
+    }
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        stopAllTasks()
+        return super.onUnbind(intent)
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        stopAllTasks()
+    }
+
+    override fun onInterrupt() {
+        stopAllTasks()
+    }
+
+    /**
+     * 徹底停止所有定時與背景排程，杜絕殭屍定時器
+     */
+    private fun stopAllTasks() {
         isServiceRunning = false
-        mainHandler.removeCallbacks(inspectionRunnable)
+        isActionPending = false
+        mainHandler.removeCallbacksAndMessages(null)
         instance = null
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // 畫面有變化時立即觸發檢驗
-        if (!isActionPending) {
+        if (isServiceRunning && !isActionPending) {
             processScreenAction()
         }
     }
 
-    override fun onInterrupt() {}
-
-    /**
-     * 靜態畫面喚醒看門狗：
-     * 發送無害音量微廣播刺激系統事件總線，徹底解決靜態畫面無障礙節點凍結問題
-     */
     private fun wakeUpSystemPipeline() {
         try {
             val am = audioManager ?: return
@@ -113,6 +124,8 @@ class AutoClickService : AccessibilityService() {
     }
 
     private fun processScreenAction() {
+        if (!isServiceRunning) return
+
         val roots = mutableListOf<AccessibilityNodeInfo>()
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
@@ -142,7 +155,7 @@ class AutoClickService : AccessibilityService() {
         }
 
         // =========================================================
-        // 【純精準比對，絕不盲點】：僅掃描頂部左上角與右上角，嚴格忽略下半部
+        // 【純精準比對，絕不盲點】：向下完整遍歷子節點並嚴格限制點擊範圍
         // =========================================================
         for (r in roots) {
             if (scanAndClickNodes(r)) {
@@ -243,75 +256,66 @@ class AutoClickService : AccessibilityService() {
     }
 
     /**
-     * 掃描元件：
-     * 1. 嚴格忽略下半部（Y > 26% 包含左下角、右下角完全排除）
-     * 2. 排除頂部導航列中右功能區
-     * 3. 鎖定「左上角」與「右上角」微型關閉按鈕
+     * 掃描元件：完整向下遞迴搜尋子葉節點，並只對符合頂部角落條件的微型按鈕觸發點擊
      */
     private fun scanAndClickNodes(node: AccessibilityNodeInfo): Boolean {
         val rect = Rect()
         node.getBoundsInScreen(rect)
         val (screenWidth, screenHeight) = getRealScreenSize()
 
-        if (screenWidth <= 0 || screenHeight <= 0) return false
+        if (screenWidth > 0 && screenHeight > 0) {
+            val centerYRatio = rect.centerY().toFloat() / screenHeight
+            val centerXRatio = rect.centerX().toFloat() / screenWidth
 
-        val centerYRatio = rect.centerY().toFloat() / screenHeight
-        val centerXRatio = rect.centerX().toFloat() / screenWidth
+            // 【嚴格點擊守衛】：只有真正落在頂部 25% 且在兩側角落的微型實體元件才允許比對點擊
+            val isTopZone = centerYRatio in 0.02f..0.25f
+            val isTopRightSpot = isTopZone && (centerXRatio in 0.75f..0.98f)
+            val isTopLeftSpot = isTopZone && (centerXRatio in 0.02f..0.22f)
 
-        // 【核心規則 1】：絕對排除螢幕下半部！Y 軸超過 26% 一律不予判定（徹底杜絕左下角、右下角誤判）
-        if (centerYRatio > 0.26f) {
-            return false
-        }
+            // 避開主頁頂部導航列中右功能區 (Y < 12%, X 在 50%~85% 之間)
+            val isInTopNavBarFunctionZone = centerYRatio < 0.12f && centerXRatio in 0.50f..0.85f
 
-        // 【核心規則 2】：排除主頁頂部導航列中右功能區 (Y < 12%, X 在 50%~85% 之間)
-        val isInTopNavBarFunctionZone = centerYRatio < 0.12f && centerXRatio in 0.50f..0.85f
-        if (isInTopNavBarFunctionZone) {
-            return false
-        }
+            if (!isInTopNavBarFunctionZone && (isTopRightSpot || isTopLeftSpot)) {
+                val text = node.text?.toString()?.trim() ?: ""
+                val desc = node.contentDescription?.toString()?.trim() ?: ""
+                val viewId = node.viewIdResourceName?.lowercase() ?: ""
 
-        val text = node.text?.toString()?.trim() ?: ""
-        val desc = node.contentDescription?.toString()?.trim() ?: ""
-        val viewId = node.viewIdResourceName?.lowercase() ?: ""
+                // 1. 文字/符號特徵比對
+                for (pattern in CLOSE_PATTERNS) {
+                    if (isMatchingPattern(text, pattern) || isMatchingPattern(desc, pattern)) {
+                        if (performGestureClick(node)) {
+                            showAlwaysToast("⚡ 點擊關閉按鈕：$pattern")
+                            return true
+                        }
+                    }
+                }
 
-        // 1. 文字/符號比對（限於頂部區域）
-        for (pattern in CLOSE_PATTERNS) {
-            if (isMatchingPattern(text, pattern) || isMatchingPattern(desc, pattern)) {
-                if (performGestureClick(node)) {
-                    showAlwaysToast("⚡ 點擊關閉按鈕：$pattern")
-                    return true
+                // 2. 元件 ID 比對
+                if (viewId.contains("close") || viewId.contains("skip") || viewId.contains("dismiss") || viewId.contains("btn_close")) {
+                    if (performGestureClick(node)) {
+                        showAlwaysToast("⚡ 點擊關閉元件")
+                        return true
+                    }
+                }
+
+                // 3. 【純幾何角落按鈕精準鎖定】：針對 Unity Ads 卡片右上角的微型方形/圓形叉叉
+                val widthRatio = rect.width().toFloat() / screenWidth
+                val heightRatio = rect.height().toFloat() / screenHeight
+                val isButtonProportion = (widthRatio in 0.025f..0.18f) && (heightRatio in 0.015f..0.14f)
+
+                val aspectRatio = if (rect.height() > 0) rect.width().toFloat() / rect.height().toFloat() else 0f
+                val isSquareOrCircle = aspectRatio in 0.50f..1.90f
+
+                if (isButtonProportion && isSquareOrCircle) {
+                    if (performGestureClick(node)) {
+                        showAlwaysToast("⚡ 精準鎖定角落關閉按鈕")
+                        return true
+                    }
                 }
             }
         }
 
-        // 2. 元件 ID 比對
-        if (viewId.contains("close") || viewId.contains("skip") || viewId.contains("dismiss") || viewId.contains("btn_close")) {
-            if (performGestureClick(node)) {
-                showAlwaysToast("⚡ 點擊關閉元件")
-                return true
-            }
-        }
-
-        // 3. 【純幾何角落按鈕精準辨識】：針對右上角與左上角的微型圓形/方形叉叉（含全黑圓底 ✕）
-        // (A) 位置限定：右上角 (X: 75%~98%, Y: 3%~22%) 或 左上角 (X: 2%~22%, Y: 3%~20%)
-        val isTopRightSpot = (centerXRatio in 0.75f..0.98f) && (centerYRatio in 0.03f..0.22f)
-        val isTopLeftSpot = (centerXRatio in 0.02f..0.22f) && (centerYRatio in 0.03f..0.20f)
-
-        // (B) 尺寸限定：寬度佔螢幕 2.5%~16%，高度佔螢幕 1.5%~12%
-        val widthRatio = rect.width().toFloat() / screenWidth
-        val heightRatio = rect.height().toFloat() / screenHeight
-        val isButtonProportion = (widthRatio in 0.025f..0.16f) && (heightRatio in 0.015f..0.12f)
-
-        // (C) 方形/圓形長寬比（0.55 ~ 1.80）
-        val aspectRatio = if (rect.height() > 0) rect.width().toFloat() / rect.height().toFloat() else 0f
-        val isSquareOrCircle = aspectRatio in 0.55f..1.80f
-
-        if ((isTopRightSpot || isTopLeftSpot) && isButtonProportion && isSquareOrCircle) {
-            if (performGestureClick(node)) {
-                showAlwaysToast("⚡ 精準鎖定角落關閉按鈕")
-                return true
-            }
-        }
-
+        // 務必遞迴搜尋所有子節點（絕不能在大容器中心點過大時中斷）
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
             if (scanAndClickNodes(child)) return true
@@ -335,8 +339,8 @@ class AutoClickService : AccessibilityService() {
         val (screenWidth, screenHeight) = getRealScreenSize()
         if (screenWidth <= 0 || screenHeight <= 0) return false
 
-        // 再次保險：若為下半部或全螢幕大圖，絕不點擊
-        if (rect.centerY() > screenHeight * 0.26f || rect.width() > screenWidth * 0.5f) {
+        // 防禦：按鈕絕不可超過螢幕 35% 寬度（嚴防按中整張卡片）
+        if (rect.width() > screenWidth * 0.35f || rect.centerY() > screenHeight * 0.25f) {
             return false
         }
 
@@ -349,7 +353,9 @@ class AutoClickService : AccessibilityService() {
             showAlwaysToast("🛠️ 除錯中：已鎖定按鈕，3 秒後執行點擊...")
 
             mainHandler.postDelayed({
-                dispatchClick(clickX, clickY)
+                if (isServiceRunning) {
+                    dispatchClick(clickX, clickY)
+                }
                 isActionPending = false
             }, 3000L)
         } else {
@@ -441,6 +447,7 @@ class AutoClickService : AccessibilityService() {
     }
 
     private fun showAlwaysToast(msg: String) {
+        if (!isServiceRunning) return
         mainHandler.post {
             try {
                 Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show()
