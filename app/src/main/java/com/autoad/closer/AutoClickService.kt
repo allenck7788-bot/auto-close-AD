@@ -19,7 +19,15 @@ class AutoClickService : AccessibilityService() {
 
     companion object {
         var instance: AutoClickService? = null
-        private const val CHECK_INTERVAL_MS = 4000L // 嚴格固定每 4 秒執行一次
+        private const val CHECK_INTERVAL_MS = 4000L // 每 4 秒定時巡檢
+
+        private val SYSTEM_SAFE_PACKAGES = listOf(
+            "settings",
+            "launcher",
+            "systemui",
+            "inputmethod",
+            "closer"
+        )
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -37,7 +45,7 @@ class AutoClickService : AccessibilityService() {
         override fun run() {
             if (!isServiceRunning) return
 
-            // 1. 無論任何狀態、任何畫面，第一順位絕對先跳提示證明定時器在線！
+            // 1. 每 4 秒定時提示
             showAlwaysToast("🔍 正在偵測廣告中...")
 
             try {
@@ -49,7 +57,6 @@ class AutoClickService : AccessibilityService() {
             } catch (e: Exception) {
                 e.printStackTrace()
             } finally {
-                // 保證 4 秒後閉環排程
                 mainHandler.postDelayed(this, CHECK_INTERVAL_MS)
             }
         }
@@ -61,7 +68,7 @@ class AutoClickService : AccessibilityService() {
         isServiceRunning = true
         audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
 
-        showAlwaysToast("AutoAdCloser 服務已連線！(每 4 秒定時巡檢)")
+        showAlwaysToast("AutoAdCloser 服務已連線！")
 
         mainHandler.removeCallbacks(inspectionRunnable)
         mainHandler.postDelayed(inspectionRunnable, 1000L)
@@ -115,12 +122,12 @@ class AutoClickService : AccessibilityService() {
             rootInActiveWindow?.let { roots.add(it) }
         }
 
-        // 避免在手機設定頁面關閉自身服務
+        // 避免在設定頁面誤觸
         for (r in roots) {
             if (isSafeScreen(r)) return
         }
 
-        // 1. 優先掃描節點文字與元件 ID
+        // 1. 優先精準比對關閉元件與文字
         var clicked = false
         for (r in roots) {
             if (scanAndClickNodes(r)) {
@@ -129,9 +136,9 @@ class AutoClickService : AccessibilityService() {
             }
         }
 
-        // 2. 若為純貼圖/無文字按鈕，直接無條件發動各類角落熱區點擊（含 Unity Ads 卡片叉叉）
+        // 2. 若無文字元件，發動防放大單點熱區點擊
         if (!clicked) {
-            triggerAllCornerHotspots()
+            triggerSingleSafeCornerHotspot()
         }
     }
 
@@ -194,6 +201,7 @@ class AutoClickService : AccessibilityService() {
         val rect = Rect()
         node.getBoundsInScreen(rect)
 
+        // 避免全螢幕容器被誤點，尺寸限制在按鈕範圍內
         if (rect.width() in 10..450 && rect.height() in 10..450) {
             clickAt(rect.centerX().toFloat(), rect.centerY().toFloat())
             return true
@@ -202,38 +210,25 @@ class AutoClickService : AccessibilityService() {
     }
 
     /**
-     * 支援直向與橫向：梯次打擊四種最核心的關閉熱區
+     * 防雙擊放大：單次巡檢只在頂部最外緣點擊一次，間隔拉長，避免觸發雙擊縮放手勢
      */
-    private fun triggerAllCornerHotspots() {
+    private fun triggerSingleSafeCornerHotspot() {
         val (width, height) = getRealScreenSize()
         if (width <= 0 || height <= 0) return
 
         val isLandscape = width > height
 
-        // 1. 截圖中的 Unity Ads 圓角卡片右上角叉叉 (X: 約 89.2%, Y: 約 9.0%)
-        val unityCardRightX = if (isLandscape) width * 0.920f else width * 0.892f
-        val unityCardTopY   = if (isLandscape) height * 0.085f else height * 0.090f
+        // 限制在頂部最邊角，避免觸碰到中央圖片瀏覽區
+        val targetX = if (isLandscape) width * 0.95f else width * 0.93f
+        val targetY = if (isLandscape) height * 0.06f else height * 0.05f
 
-        // 2. 全螢幕極限右上角叉叉
-        val extremeRightX   = if (isLandscape) width * 0.945f else width * 0.938f
-        val extremeTopY     = if (isLandscape) height * 0.080f else height * 0.068f
-
-        // 3. 試玩廣告金幣旁內縮右上角
-        val innerRightX     = if (isLandscape) width * 0.900f else width * 0.835f
-
-        // 4. 左上角常規熱區
-        val extremeLeftX    = if (isLandscape) width * 0.055f else width * 0.085f
-
-        // 依序連續發動點擊補刀：Unity 卡片叉 -> 極限右上 -> 內縮右上 -> 左上
-        clickAt(unityCardRightX, unityCardTopY)
-        mainHandler.postDelayed({ clickAt(extremeRightX, extremeTopY) }, 150L)
-        mainHandler.postDelayed({ clickAt(innerRightX, extremeTopY) }, 300L)
-        mainHandler.postDelayed({ clickAt(extremeLeftX, unityCardTopY) }, 450L)
+        // 單次輕觸，不發送短時間密集多點
+        clickAt(targetX, targetY)
     }
 
     private fun clickAt(x: Float, y: Float) {
         val path = Path().apply { moveTo(x, y) }
-        val stroke = GestureDescription.StrokeDescription(path, 0, 50)
+        val stroke = GestureDescription.StrokeDescription(path, 0, 40)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
         dispatchGesture(gesture, null, null)
     }
@@ -251,9 +246,6 @@ class AutoClickService : AccessibilityService() {
         }
     }
 
-    /**
-     * 強制每次建立新 Toast 實體，徹底繞過 Android 11+ 系統頻率防抖限制
-     */
     private fun showAlwaysToast(msg: String) {
         mainHandler.post {
             try {
