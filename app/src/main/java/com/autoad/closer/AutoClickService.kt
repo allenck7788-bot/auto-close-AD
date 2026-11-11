@@ -19,6 +19,7 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
 import android.widget.Toast
+import kotlin.math.abs
 
 class AutoClickService : AccessibilityService() {
 
@@ -26,25 +27,21 @@ class AutoClickService : AccessibilityService() {
         var instance: AutoClickService? = null
         private const val CHECK_INTERVAL_MS = 4000L // 每 4 秒定時巡檢
 
-        // 系統安全清單
+        // 系統安全清單（僅保留設定與輸入法，移除相簿以利直接看截圖測試）
         private val SYSTEM_SAFE_PACKAGES = listOf(
             "settings",
-            "launcher",
-            "systemui",
             "inputmethod",
-            "closer",
-            "gallery",
-            "photos"
+            "closer"
         )
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isServiceRunning = false
-    private var isActionPending = false
+    private var isActionPending = false // 防重入標記
     private var audioManager: AudioManager? = null
     private var windowManager: WindowManager? = null
 
-    // 常規廣告關閉特徵清單
+    // 常規文字與符號特徵
     private val CLOSE_PATTERNS = listOf(
         "✕", "×", "✖", "X", "x",
         "⏯", "▶|", "|▶",
@@ -52,18 +49,15 @@ class AutoClickService : AccessibilityService() {
         "Close", "close", "SKIP", "Skip", "skip"
     )
 
-    // 廣告卡片識別特徵（用來確保畫面確為廣告，絕不盲點）
-    private val AD_INDICATORS = listOf(
-        "Unity Ads", "unity ads", "廣告", "免費", "立即領取", "安裝", "立即安裝", "下載", "PLAY NOW", "Play Now"
-    )
-
     private val inspectionRunnable = object : Runnable {
         override fun run() {
             if (!isServiceRunning) return
 
+            // 每輪巡檢前強制提示
             showAlwaysToast("🔍 正在偵測廣告中...")
 
             try {
+                // 喚醒視窗事件流防止凍結
                 wakeUpSystemPipeline()
 
                 if (!isActionPending) {
@@ -139,28 +133,12 @@ class AutoClickService : AccessibilityService() {
         }
 
         // =========================================================
-        // 【第一軌：純精準元件特徵比對】
+        // 【純精準比對，絕不盲點】：尋找符合條件的實體關閉元件
         // =========================================================
         for (r in roots) {
             if (scanAndClickNodes(r)) {
-                return
-            }
-        }
-
-        // =========================================================
-        // 【第二軌：廣告畫面確立下的右上角叉叉精準命中】
-        // 嚴格檢驗：畫面必須出現明確廣告標籤（如 Unity Ads/安裝/免費）才啟動
-        // =========================================================
-        var isAdScreen = false
-        for (r in roots) {
-            if (hasAnyAdIndicator(r)) {
-                isAdScreen = true
                 break
             }
-        }
-
-        if (isAdScreen) {
-            handleVerifiedAdTopRightClose()
         }
     }
 
@@ -188,21 +166,6 @@ class AutoClickService : AccessibilityService() {
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
             if (hasTextKeyword(child, keyword)) return true
-        }
-        return false
-    }
-
-    private fun hasAnyAdIndicator(node: AccessibilityNodeInfo): Boolean {
-        val text = node.text?.toString() ?: ""
-        val desc = node.contentDescription?.toString() ?: ""
-        for (indicator in AD_INDICATORS) {
-            if (text.contains(indicator, ignoreCase = true) || desc.contains(indicator, ignoreCase = true)) {
-                return true
-            }
-        }
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            if (hasAnyAdIndicator(child)) return true
         }
         return false
     }
@@ -270,6 +233,13 @@ class AutoClickService : AccessibilityService() {
         return false
     }
 
+    /**
+     * 掃描元件：
+     * 1. 導航列排除（防首頁誤觸）
+     * 2. 文字/符號特徵比對
+     * 3. 元件 ID 比對
+     * 4. 針對 Unity Ads 等無文字圖片叉叉的「微型方形幾何比例精準鎖定」
+     */
     private fun scanAndClickNodes(node: AccessibilityNodeInfo): Boolean {
         val rect = Rect()
         node.getBoundsInScreen(rect)
@@ -288,7 +258,7 @@ class AutoClickService : AccessibilityService() {
         val desc = node.contentDescription?.toString()?.trim() ?: ""
         val viewId = node.viewIdResourceName?.lowercase() ?: ""
 
-        // 1. 文字與符號比對
+        // 1. 文字/符號比對
         for (pattern in CLOSE_PATTERNS) {
             if (isMatchingPattern(text, pattern) || isMatchingPattern(desc, pattern)) {
                 if (performGestureClick(node)) {
@@ -306,44 +276,33 @@ class AutoClickService : AccessibilityService() {
             }
         }
 
+        // 3. 【純幾何精準鎖定】：針對 Unity Ads 卡片右上角的微型方形叉叉
+        // (A) 中心點嚴格鎖定在卡片右上角熱區 (X: 78%~96%, Y: 5%~16%)
+        val centerXRatio = rect.centerX().toFloat() / screenWidth
+        val centerYRatio = rect.centerY().toFloat() / screenHeight
+        val isTopRightSpot = (centerXRatio in 0.78f..0.96f) && (centerYRatio in 0.05f..0.16f)
+
+        // (B) 實體按鈕尺寸：寬度佔全螢幕 3%~14%，高度佔全螢幕 2%~10%
+        val widthRatio = rect.width().toFloat() / screenWidth
+        val heightRatio = rect.height().toFloat() / screenHeight
+        val isButtonSize = (widthRatio in 0.03f..0.14f) && (heightRatio in 0.02f..0.10f)
+
+        // (C) 方形比例判定：按鈕長寬比必須接近正方形 (0.55 ~ 1.8)，杜絕抓到長條文字框或背景圖
+        val aspectRatio = if (rect.height() > 0) rect.width().toFloat() / rect.height().toFloat() else 0f
+        val isSquareLike = aspectRatio in 0.55f..1.80f
+
+        if (isTopRightSpot && isButtonSize && isSquareLike) {
+            if (performGestureClick(node)) {
+                showAlwaysToast("⚡ 精準鎖定右上角叉叉元件")
+                return true
+            }
+        }
+
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
             if (scanAndClickNodes(child)) return true
         }
         return false
-    }
-
-    /**
-     * 當確定為廣告卡片畫面時，精準鎖定右上角叉叉
-     */
-    private fun handleVerifiedAdTopRightClose() {
-        val (screenWidth, screenHeight) = getRealScreenSize()
-        if (screenWidth <= 0 || screenHeight <= 0) return
-
-        // Unity Ads 右上角叉叉精準標準座標 (X: 89%, Y: 9.5%)
-        val targetX = screenWidth * 0.89f
-        val targetY = screenHeight * 0.095f
-
-        val targetRect = Rect(
-            (targetX - 45).toInt(),
-            (targetY - 45).toInt(),
-            (targetX + 45).toInt(),
-            (targetY + 45).toInt()
-        )
-
-        if (isDebugModeEnabled()) {
-            isActionPending = true
-            showDebugMarkerUnderButton(targetRect, 3500L)
-            showAlwaysToast("🛠️ 除錯中：鎖定廣告右上角叉叉，3 秒後點擊...")
-
-            mainHandler.postDelayed({
-                dispatchClick(targetX, targetY)
-                isActionPending = false
-            }, 3000L)
-        } else {
-            showAlwaysToast("⚡ 關閉廣告卡片")
-            dispatchClick(targetX, targetY)
-        }
     }
 
     private fun isMatchingPattern(source: String, pattern: String): Boolean {
@@ -362,6 +321,7 @@ class AutoClickService : AccessibilityService() {
         val (screenWidth, screenHeight) = getRealScreenSize()
         if (screenWidth <= 0 || screenHeight <= 0) return false
 
+        // 避開全螢幕大圖點擊
         if (rect.width() > screenWidth * 0.5f && rect.height() > screenHeight * 0.5f) {
             return false
         }
@@ -371,6 +331,7 @@ class AutoClickService : AccessibilityService() {
 
         if (isDebugModeEnabled()) {
             isActionPending = true
+            // 在叉叉正下方緊貼顯示標記
             showDebugMarkerUnderButton(rect, 3500L)
             showAlwaysToast("🛠️ 除錯中：已鎖定按鈕，3 秒後執行點擊...")
 
