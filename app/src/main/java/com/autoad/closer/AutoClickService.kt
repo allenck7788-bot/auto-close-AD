@@ -19,9 +19,8 @@ class AutoClickService : AccessibilityService() {
 
     companion object {
         var instance: AutoClickService? = null
-        private const val CHECK_INTERVAL_MS = 4000L // 每 4 秒巡檢一次
+        private const val CHECK_INTERVAL_MS = 4000L
 
-        // 系統安全清單
         private val SYSTEM_SAFE_PACKAGES = listOf(
             "settings",
             "launcher",
@@ -35,7 +34,6 @@ class AutoClickService : AccessibilityService() {
     private var isServiceRunning = false
     private var audioManager: AudioManager? = null
 
-    // 常規廣告關閉與快進特徵清單
     private val CLOSE_PATTERNS = listOf(
         "✕", "×", "✖", "X", "x",
         "⏯", "▶|", "|▶", ">>", "»", ">", "⏩",
@@ -47,14 +45,10 @@ class AutoClickService : AccessibilityService() {
         override fun run() {
             if (!isServiceRunning) return
 
-            // 每 4 秒固定提示正在運作
             showAlwaysToast("🔍 正在偵測廣告中...")
 
             try {
-                // 音量微震盪喚醒底層視窗管線
                 triggerVolumeWakeup()
-
-                // 執行精準比對與關閉
                 processScreenAction()
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -83,9 +77,7 @@ class AutoClickService : AccessibilityService() {
         instance = null
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // 系統事件連帶巡檢
-    }
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
 
     override fun onInterrupt() {}
 
@@ -126,23 +118,18 @@ class AutoClickService : AccessibilityService() {
 
         if (roots.isEmpty()) return
 
-        // 避免在設定頁面誤觸
         for (r in roots) {
             if (isSafeScreen(r)) return
         }
 
-        // =========================================================
-        // 【獨立專屬永久功能】：若出現「完整快取中」則自動點擊左上角 ←
-        // =========================================================
+        // 專屬功能：完整快取中 -> 點擊左上角 ←
         for (r in roots) {
             if (checkAndHandleCachingScreen(r)) {
                 return
             }
         }
 
-        // =========================================================
-        // 【純精準比對，絕不盲點】：只有抓到明確關閉按鈕才會點擊
-        // =========================================================
+        // 純精準比對：尋找關閉按鈕，絕不盲點
         for (r in roots) {
             if (scanAndClickNodes(r)) {
                 break
@@ -150,9 +137,6 @@ class AutoClickService : AccessibilityService() {
         }
     }
 
-    /**
-     * 【固定功能】檢查是否處於「完整快取中」畫面，並點擊左上角返回
-     */
     private fun checkAndHandleCachingScreen(root: AccessibilityNodeInfo): Boolean {
         if (!hasTextKeyword(root, "完整快取中")) {
             return false
@@ -160,12 +144,10 @@ class AutoClickService : AccessibilityService() {
 
         showAlwaysToast("⚡ 偵測到「完整快取中」，點擊左上返回")
 
-        // 1. 優先嘗試尋找左上角具體的返回鍵元件 (←, Back, Navigate up)
         if (findAndClickBackButton(root)) {
             return true
         }
 
-        // 2. 若箭頭按鈕為純圖片無文字/ID，點擊左上角返回實體座標
         clickTopLeftBackButton()
         return true
     }
@@ -177,3 +159,145 @@ class AutoClickService : AccessibilityService() {
             return true
         }
         for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            if (hasTextKeyword(child, keyword)) return true
+        }
+        return false
+    }
+
+    private fun findAndClickBackButton(node: AccessibilityNodeInfo): Boolean {
+        val text = node.text?.toString()?.trim() ?: ""
+        val desc = node.contentDescription?.toString()?.trim() ?: ""
+        val viewId = node.viewIdResourceName?.lowercase() ?: ""
+
+        val isBackKey = text == "←" || desc == "←" ||
+                desc.contains("返回", ignoreCase = true) ||
+                desc.contains("navigate up", ignoreCase = true) ||
+                desc.contains("back", ignoreCase = true) ||
+                viewId.contains("back") || viewId.contains("up")
+
+        if (isBackKey) {
+            val rect = Rect()
+            node.getBoundsInScreen(rect)
+            if (rect.centerX() < 300 && rect.centerY() < 400) {
+                if (performGestureClick(node)) return true
+            }
+        }
+
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            if (findAndClickBackButton(child)) return true
+        }
+        return false
+    }
+
+    private fun clickTopLeftBackButton() {
+        val (width, height) = getRealScreenSize()
+        if (width <= 0 || height <= 0) return
+
+        val isLandscape = width > height
+        val backX = if (isLandscape) width * 0.05f else width * 0.075f
+        val backY = if (isLandscape) height * 0.06f else height * 0.048f
+
+        val path = Path().apply { moveTo(backX, backY) }
+        val stroke = GestureDescription.StrokeDescription(path, 0L, 50L)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        dispatchGesture(gesture, null, null)
+    }
+
+    private fun isSafeScreen(node: AccessibilityNodeInfo): Boolean {
+        val text = node.text?.toString() ?: ""
+        val desc = node.contentDescription?.toString() ?: ""
+        val pkg = node.packageName?.toString()?.lowercase() ?: ""
+
+        if (text.contains("AutoAdCloser", ignoreCase = true) || 
+            desc.contains("AutoAdCloser", ignoreCase = true) ||
+            pkg.contains("settings")) {
+            return true
+        }
+
+        for (safe in SYSTEM_SAFE_PACKAGES) {
+            if (pkg.contains(safe)) {
+                return true
+            }
+        }
+
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            if (isSafeScreen(child)) return true
+        }
+        return false
+    }
+
+    private fun scanAndClickNodes(node: AccessibilityNodeInfo): Boolean {
+        val text = node.text?.toString()?.trim() ?: ""
+        val desc = node.contentDescription?.toString()?.trim() ?: ""
+        val viewId = node.viewIdResourceName?.lowercase() ?: ""
+
+        for (pattern in CLOSE_PATTERNS) {
+            if (isMatchingPattern(text, pattern) || isMatchingPattern(desc, pattern)) {
+                if (performGestureClick(node)) {
+                    showAlwaysToast("⚡ 點擊關閉按鈕：$pattern")
+                    return true
+                }
+            }
+        }
+
+        if (viewId.contains("close") || viewId.contains("skip") || viewId.contains("dismiss")) {
+            if (performGestureClick(node)) {
+                showAlwaysToast("⚡ 點擊關閉元件")
+                return true
+            }
+        }
+
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            if (scanAndClickNodes(child)) return true
+        }
+        return false
+    }
+
+    private fun isMatchingPattern(source: String, pattern: String): Boolean {
+        if (source.isEmpty()) return false
+        return if (pattern.length == 1) {
+            source.contains(pattern)
+        } else {
+            source.equals(pattern, ignoreCase = true) || source.contains(pattern, ignoreCase = true)
+        }
+    }
+
+    private fun performGestureClick(node: AccessibilityNodeInfo): Boolean {
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+
+        if (rect.width() in 10..450 && rect.height() in 10..450) {
+            val path = Path().apply { moveTo(rect.centerX().toFloat(), rect.centerY().toFloat()) }
+            val stroke = GestureDescription.StrokeDescription(path, 0L, 50L)
+            val gesture = GestureDescription.Builder().addStroke(stroke).build()
+            dispatchGesture(gesture, null, null)
+            return true
+        }
+        return false
+    }
+
+    private fun getRealScreenSize(): Pair<Int, Int> {
+        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = wm.currentWindowMetrics.bounds
+            Pair(bounds.width(), bounds.height())
+        } else {
+            val dm = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getRealMetrics(dm)
+            Pair(dm.widthPixels, dm.heightPixels)
+        }
+    }
+
+    private fun showAlwaysToast(msg: String) {
+        mainHandler.post {
+            try {
+                Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show()
+            } catch (_: Exception) {}
+        }
+    }
+}
