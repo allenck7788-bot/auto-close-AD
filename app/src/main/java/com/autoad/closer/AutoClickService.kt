@@ -253,7 +253,9 @@ class AutoClickService : AccessibilityService() {
     }
 
     /**
-     * 掃描元件：加入左上角漢堡選單 (≡) 排除白名單
+     * 掃描元件：
+     * 1. 排除左上漢堡選單 (≡)
+     * 2. 排除右上三點更多選項 (⋮)
      */
     private fun scanAndClickNodes(node: AccessibilityNodeInfo): Boolean {
         val rect = Rect()
@@ -275,7 +277,7 @@ class AutoClickService : AccessibilityService() {
             val desc = node.contentDescription?.toString()?.trim() ?: ""
             val viewId = node.viewIdResourceName?.lowercase() ?: ""
 
-            // 【核心防護 1】：嚴格排除左上角三條線漢堡選單 (≡ / Menu / Drawer)
+            // 【白名單排除 1】：左上角三條線漢堡選單 (≡ / Menu / Drawer)
             val isHamburgerMenu = text == "≡" || desc == "≡" || text.contains("≡") || desc.contains("≡") ||
                     desc.contains("menu", ignoreCase = true) || desc.contains("drawer", ignoreCase = true) ||
                     desc.contains("選單", ignoreCase = true) || desc.contains("菜单", ignoreCase = true) ||
@@ -286,13 +288,24 @@ class AutoClickService : AccessibilityService() {
                 return false
             }
 
+            // 【白名單排除 2】：右上角三個直點更多選項 (⋮ / More / Overflow)
+            val isMoreOptionsButton = text == "⋮" || desc == "⋮" || text.contains("⋮") || desc.contains("⋮") ||
+                    text == "..." || desc == "..." || text == "…" || desc == "…" ||
+                    desc.contains("more options", ignoreCase = true) || desc.contains("overflow", ignoreCase = true) ||
+                    desc.contains("更多選項", ignoreCase = true) || desc.contains("更多选项", ignoreCase = true) ||
+                    desc.contains("更多", ignoreCase = true) || viewId.contains("overflow") || viewId.contains("more")
+
+            if (isMoreOptionsButton) {
+                return false
+            }
+
             if (!isInTopNavBarFunctionZone && (isTopRightSpot || isTopLeftSpot)) {
                 // 1. 文字/符號比對
                 for (pattern in CLOSE_PATTERNS) {
                     if (isMatchingPattern(text, pattern) || isMatchingPattern(desc, pattern)) {
                         if (performGestureClick(node)) {
                             val sec = getClickDelaySec()
-                            showAlwaysToast("⚡ 偵測到關閉按鈕：$pattern (等待${sec}秒後點擊)")
+                            showAlwaysToast("⚡ 偵測到關閉按鈕：$pattern (倒數${sec}秒)")
                             return true
                         }
                     }
@@ -302,12 +315,12 @@ class AutoClickService : AccessibilityService() {
                 if (viewId.contains("close") || viewId.contains("skip") || viewId.contains("dismiss") || viewId.contains("btn_close")) {
                     if (performGestureClick(node)) {
                         val sec = getClickDelaySec()
-                        showAlwaysToast("⚡ 偵測到關閉元件 (等待${sec}秒後點擊)")
+                        showAlwaysToast("⚡ 偵測到關閉元件 (倒數${sec}秒)")
                         return true
                     }
                 }
 
-                // 3. Unity Ads 卡片右上角微型按鈕比對（排除左上角無文字元件，防止誤觸三條線漢堡圖）
+                // 3. Unity Ads 卡片右上角微型按鈕比對
                 val widthRatio = rect.width().toFloat() / screenWidth
                 val heightRatio = rect.height().toFloat() / screenHeight
                 val isButtonProportion = (widthRatio in 0.025f..0.18f) && (heightRatio in 0.015f..0.14f)
@@ -315,11 +328,10 @@ class AutoClickService : AccessibilityService() {
                 val aspectRatio = if (rect.height() > 0) rect.width().toFloat() / rect.height().toFloat() else 0f
                 val isSquareOrCircle = aspectRatio in 0.50f..1.90f
 
-                // 純幾何判定僅套用於「右上角」按鈕，左上角若無文字絕對不盲點
                 if (isTopRightSpot && isButtonProportion && isSquareOrCircle) {
                     if (performGestureClick(node)) {
                         val sec = getClickDelaySec()
-                        showAlwaysToast("⚡ 鎖定關閉按鈕 (等待${sec}秒後點擊)")
+                        showAlwaysToast("⚡ 鎖定關閉按鈕 (倒數${sec}秒)")
                         return true
                     }
                 }
@@ -342,16 +354,13 @@ class AutoClickService : AccessibilityService() {
         }
     }
 
-    /**
-     * 讀取使用者自訂的等待秒數（預設 8 秒）
-     */
     private fun getClickDelaySec(): Int {
         val sp = getSharedPreferences("autoad_prefs", Context.MODE_PRIVATE)
         return sp.getInt("click_delay_sec", 8)
     }
 
     /**
-     * 手勢延遲執行：依使用者選擇的秒數進行動態倒數與標籤提示
+     * 手勢延遲執行：啟動每秒即時倒數計時器
      */
     private fun performGestureClick(node: AccessibilityNodeInfo): Boolean {
         val rect = Rect()
@@ -369,20 +378,101 @@ class AutoClickService : AccessibilityService() {
 
         isActionPending = true
 
-        val delaySec = getClickDelaySec()
-        val delayMillis = delaySec * 1000L
+        val totalSec = getClickDelaySec()
 
-        // 標籤展示時間為倒數時間加 500 毫秒，維持全程陪伴提示
-        showDebugMarkerUnderButton(rect, "▲ 關閉！ (${delaySec}秒)", delayMillis + 500L)
-
-        mainHandler.postDelayed({
+        // 啟動每秒跳動的即時倒數視窗
+        startCountdownOverlay(rect, totalSec) {
             if (isServiceRunning) {
                 dispatchClick(clickX, clickY)
             }
             isActionPending = false
-        }, delayMillis)
+        }
 
         return true
+    }
+
+    /**
+     * 每秒跳動的「▲ 關閉！ (秒數)」倒數懸浮視窗
+     */
+    private fun startCountdownOverlay(buttonRect: Rect, totalSec: Int, onFinish: () -> Unit) {
+        mainHandler.post {
+            val wm = windowManager ?: run {
+                onFinish()
+                return@post
+            }
+
+            var currentSec = totalSec
+
+            val markView = TextView(applicationContext).apply {
+                text = "▲ 關閉！ $currentSec"
+                setTextColor(Color.WHITE)
+                textSize = 12f
+                setBackgroundColor(Color.parseColor("#E53935"))
+                setPadding(12, 4, 12, 4)
+            }
+
+            markView.measure(
+                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+            )
+            val markWidth = markView.measuredWidth
+
+            val (screenWidth, _) = getRealScreenSize()
+
+            var targetX = buttonRect.centerX() - (markWidth / 2)
+            if (screenWidth > 0) {
+                targetX = targetX.coerceIn(8, screenWidth - markWidth - 8)
+            }
+            val targetY = buttonRect.bottom + 2
+
+            val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+            } else {
+                @Suppress("DEPRECATION")
+                WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
+            }
+
+            val params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                layoutType,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.START
+                x = targetX
+                y = targetY
+            }
+
+            try {
+                wm.addView(markView, params)
+            } catch (_: Exception) {
+                onFinish()
+                return@post
+            }
+
+            // 倒數計時 Runnable，每 1000ms 跳一次
+            val countdownRunnable = object : Runnable {
+                override fun run() {
+                    if (!isServiceRunning) {
+                        try { wm.removeView(markView) } catch (_: Exception) {}
+                        return
+                    }
+
+                    currentSec--
+                    if (currentSec > 0) {
+                        markView.text = "▲ 關閉！ $currentSec"
+                        mainHandler.postDelayed(this, 1000L)
+                    } else {
+                        // 倒數歸零，移除視窗並觸發點擊手勢
+                        try { wm.removeView(markView) } catch (_: Exception) {}
+                        onFinish()
+                    }
+                }
+            }
+
+            mainHandler.postDelayed(countdownRunnable, 1000L)
+        }
     }
 
     private fun dispatchClick(x: Float, y: Float) {
@@ -395,66 +485,6 @@ class AutoClickService : AccessibilityService() {
     private fun isDebugModeEnabled(): Boolean {
         val sp = getSharedPreferences("autoad_prefs", Context.MODE_PRIVATE)
         return sp.getBoolean("debug_mode", false)
-    }
-
-    /**
-     * 在按鈕下方顯示紅底白字「▲ 關閉！ (X秒)」
-     */
-    private fun showDebugMarkerUnderButton(buttonRect: Rect, labelText: String, displayDurationMs: Long) {
-        mainHandler.post {
-            val wm = windowManager ?: return@post
-            try {
-                val markView = TextView(applicationContext).apply {
-                    text = labelText
-                    setTextColor(Color.WHITE)
-                    textSize = 12f
-                    setBackgroundColor(Color.parseColor("#E53935"))
-                    setPadding(12, 4, 12, 4)
-                }
-
-                markView.measure(
-                    View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
-                    View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
-                )
-                val markWidth = markView.measuredWidth
-
-                val (screenWidth, _) = getRealScreenSize()
-
-                var targetX = buttonRect.centerX() - (markWidth / 2)
-                if (screenWidth > 0) {
-                    targetX = targetX.coerceIn(8, screenWidth - markWidth - 8)
-                }
-
-                val targetY = buttonRect.bottom + 2
-
-                val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
-                } else {
-                    @Suppress("DEPRECATION")
-                    WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
-                }
-
-                val params = WindowManager.LayoutParams(
-                    WindowManager.LayoutParams.WRAP_CONTENT,
-                    WindowManager.LayoutParams.WRAP_CONTENT,
-                    layoutType,
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
-                    PixelFormat.TRANSLUCENT
-                ).apply {
-                    gravity = Gravity.TOP or Gravity.START
-                    x = targetX
-                    y = targetY
-                }
-
-                wm.addView(markView, params)
-
-                mainHandler.postDelayed({
-                    try {
-                        wm.removeView(markView)
-                    } catch (_: Exception) {}
-                }, displayDurationMs)
-            } catch (_: Exception) {}
-        }
     }
 
     private fun getRealScreenSize(): Pair<Int, Int> {
