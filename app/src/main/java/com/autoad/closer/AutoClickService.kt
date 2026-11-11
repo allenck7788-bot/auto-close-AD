@@ -14,24 +14,23 @@ class AutoClickService : AccessibilityService() {
 
     companion object {
         var instance: AutoClickService? = null
-        private const val COOLDOWN_MS = 4000L // 4 秒強制冷卻
-
-        // 系統與日常絕對安全清單：在這些畫面中一律不進行任何動作
-        private val SAFE_PACKAGES = listOf(
-            "settings",          // 系統設定（避免點擊到無障礙開關）
-            "launcher",          // 各廠牌桌面
-            "systemui",         // 系統狀態列與導航
-            "inputmethod",       // 鍵盤輸入法
-            "closer"            // 本 App 自身頁面
-        )
+        private const val COOLDOWN_MS = 3500L // 安全冷卻 3.5 秒
     }
 
     private var lastActionTime = 0L
 
+    // 特殊跳過符號與關鍵字清單（包含圖 02 的 >> 符號）
+    private val CLOSE_PATTERNS = listOf(
+        ">>", ">>", "»", ">",
+        "關閉", "跳過", "關閉廣告", "跳過廣告",
+        "Close", "close", "SKIP", "Skip", "skip",
+        "✕", "×", "✖"
+    )
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
-        showToast("AutoAdCloser 已啟動 (已加入系統設定安全防護)")
+        showToast("AutoAdCloser 已啟動")
     }
 
     override fun onDestroy() {
@@ -42,65 +41,81 @@ class AutoClickService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
 
-        // 1. 冷卻時間未滿 4 秒直接忽略
         val currentTime = System.currentTimeMillis()
         if (currentTime - lastActionTime < COOLDOWN_MS) {
             return
         }
 
-        // 2. 安全防護：檢查當前 App 是否在安全清單內（如截圖中的無障礙設定）
-        val pkg = event.packageName?.toString()?.lowercase() ?: ""
-        for (safe in SAFE_PACKAGES) {
-            if (pkg.contains(safe)) {
-                return // 直接返回，絕不在設定頁面發動點擊
-            }
-        }
-
         try {
             val root = rootInActiveWindow ?: event.source ?: return
+
+            // 1. 最高防護：只要當前畫面有 "AutoAdCloser"，代表在設定頁或自家頁面，一律強制退出不動作！
+            if (isSafeScreen(root)) {
+                return
+            }
+
+            // 2. 僅針對具備關閉/跳過特徵的精準節點發動點擊（不盲點，防跳轉）
             scanAndClickNodes(root)
         } catch (_: Exception) {}
     }
 
     override fun onInterrupt() {}
 
+    /**
+     * 檢查當前畫面是否為設定頁面或安全白名單
+     */
+    private fun isSafeScreen(node: AccessibilityNodeInfo): Boolean {
+        val text = node.text?.toString() ?: ""
+        val desc = node.contentDescription?.toString() ?: ""
+        val pkg = node.packageName?.toString()?.lowercase() ?: ""
+
+        if (text.contains("AutoAdCloser", ignoreCase = true) || 
+            desc.contains("AutoAdCloser", ignoreCase = true) ||
+            pkg.contains("settings")) {
+            return true
+        }
+
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            if (isSafeScreen(child)) return true
+        }
+        return false
+    }
+
+    /**
+     * 掃描並精準點擊關閉按鈕
+     */
     private fun scanAndClickNodes(node: AccessibilityNodeInfo): Boolean {
         val currentTime = System.currentTimeMillis()
         if (currentTime - lastActionTime < COOLDOWN_MS) return true
-
-        // 僅保留精確的關閉特徵，剔除容易誤點的單英文字母 "x" / "X"
-        val exactKeywords = listOf(
-            "關閉", "跳過", "關閉廣告", "跳過廣告", 
-            "Close", "close", "SKIP", "Skip", "skip", 
-            "✕", "×", "✖"
-        )
 
         val text = node.text?.toString()?.trim() ?: ""
         val desc = node.contentDescription?.toString()?.trim() ?: ""
         val viewId = node.viewIdResourceName?.lowercase() ?: ""
 
-        // 1. 比對精準文字或 ContentDescription
-        for (kw in exactKeywords) {
-            if (text == kw || desc == kw || text.contains(kw) || desc.contains(kw)) {
-                if (performClickOnNode(node)) {
+        // 1. 比對關鍵字（含 >> 符號）
+        for (pattern in CLOSE_PATTERNS) {
+            if (isMatchingPattern(text, pattern) || isMatchingPattern(desc, pattern)) {
+                if (performSafeClick(node)) {
                     lastActionTime = System.currentTimeMillis()
-                    showToast("⚡ 自動點擊廣告關閉：$kw")
+                    showToast("⚡ 已自動點擊：$pattern")
                     return true
                 }
             }
         }
 
-        // 2. 比對廣告專用 View ID 特徵
-        if (viewId.contains("btn_close") || viewId.contains("close_button") || 
-            viewId.contains("btn_skip") || viewId.contains("ad_close")) {
-            if (performClickOnNode(node)) {
+        // 2. 比對廣告 SDK 的 ID 特徵
+        if (viewId.contains("btn_close") || viewId.contains("close_btn") || 
+            viewId.contains("btn_skip") || viewId.contains("skip_btn") ||
+            viewId.contains("iv_close") || viewId.contains("ad_close")) {
+            if (performSafeClick(node)) {
                 lastActionTime = System.currentTimeMillis()
-                showToast("⚡ 已點擊廣告關閉按鈕")
+                showToast("⚡ 已點擊廣告按鈕")
                 return true
             }
         }
 
-        // 3. 遞迴掃描子元件
+        // 3. 遞迴子節點
         for (i in 0 until node.childCount) {
             try {
                 if (System.currentTimeMillis() - lastActionTime < COOLDOWN_MS) return true
@@ -112,14 +127,28 @@ class AutoClickService : AccessibilityService() {
         return false
     }
 
-    private fun performClickOnNode(node: AccessibilityNodeInfo): Boolean {
+    private fun isMatchingPattern(source: String, pattern: String): Boolean {
+        if (source.isEmpty()) return false
+        // 對於 >> 等符號，進行精確或包含判定
+        return if (pattern == ">>" || pattern == ">" || pattern == "»") {
+            source.contains(pattern)
+        } else {
+            source == pattern || (pattern.length > 1 && source.contains(pattern))
+        }
+    }
+
+    /**
+     * 安全點擊節點
+     */
+    private fun performSafeClick(node: AccessibilityNodeInfo): Boolean {
         if (node.isClickable) {
             return node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
         }
 
+        // 若不可點擊，取得按鈕的實體座標模擬點擊其中心
         val rect = Rect()
         node.getBoundsInScreen(rect)
-        if (rect.width() > 0 && rect.height() > 0) {
+        if (rect.width() in 20..400 && rect.height() in 20..400) { // 限制在一般按鈕大小，避免點擊到全螢幕廣告圖層
             clickAt(rect.centerX().toFloat(), rect.centerY().toFloat())
             return true
         }
