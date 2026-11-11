@@ -5,7 +5,6 @@ import android.accessibilityservice.GestureDescription
 import android.content.Context
 import android.graphics.Path
 import android.graphics.Rect
-import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -19,12 +18,11 @@ class AutoClickService : AccessibilityService() {
 
     companion object {
         var instance: AutoClickService? = null
-        private const val CHECK_INTERVAL_MS = 4000L
+        private const val CHECK_INTERVAL_MS = 4000L // 每 4 秒定時巡檢
 
+        // 系統安全清單：在設定與特定系統畫面不觸發點擊
         private val SYSTEM_SAFE_PACKAGES = listOf(
             "settings",
-            "launcher",
-            "systemui",
             "inputmethod",
             "closer"
         )
@@ -32,8 +30,8 @@ class AutoClickService : AccessibilityService() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isServiceRunning = false
-    private var audioManager: AudioManager? = null
 
+    // 常規廣告關閉與快進特徵
     private val CLOSE_PATTERNS = listOf(
         "✕", "×", "✖", "X", "x",
         "⏯", "▶|", "|▶", ">>", "»", ">", "⏩",
@@ -45,14 +43,15 @@ class AutoClickService : AccessibilityService() {
         override fun run() {
             if (!isServiceRunning) return
 
+            // 1. 每 4 秒固定提示正在運作，絕對第一執行
             showAlwaysToast("🔍 正在偵測廣告中...")
 
             try {
-                triggerVolumeWakeup()
                 processScreenAction()
             } catch (e: Exception) {
                 e.printStackTrace()
             } finally {
+                // 閉環排程：確保 4 秒後必定再次執行
                 mainHandler.postDelayed(this, CHECK_INTERVAL_MS)
             }
         }
@@ -62,7 +61,6 @@ class AutoClickService : AccessibilityService() {
         super.onServiceConnected()
         instance = this
         isServiceRunning = true
-        audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
 
         showAlwaysToast("AutoAdCloser 服務已連線！")
 
@@ -77,30 +75,11 @@ class AutoClickService : AccessibilityService() {
         instance = null
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        // 系統事件連帶巡檢
+    }
 
     override fun onInterrupt() {}
-
-    private fun triggerVolumeWakeup() {
-        val am = audioManager ?: return
-        try {
-            val streamType = AudioManager.STREAM_MUSIC
-            val currentVol = am.getStreamVolume(streamType)
-            val maxVol = am.getStreamMaxVolume(streamType)
-
-            if (currentVol > 0) {
-                am.setStreamVolume(streamType, currentVol - 1, AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE)
-                mainHandler.postDelayed({
-                    am.setStreamVolume(streamType, currentVol, AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE)
-                }, 40L)
-            } else if (currentVol < maxVol) {
-                am.setStreamVolume(streamType, currentVol + 1, AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE)
-                mainHandler.postDelayed({
-                    am.setStreamVolume(streamType, currentVol, AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE)
-                }, 40L)
-            }
-        } catch (_: Exception) {}
-    }
 
     private fun processScreenAction() {
         val roots = mutableListOf<AccessibilityNodeInfo>()
@@ -118,18 +97,23 @@ class AutoClickService : AccessibilityService() {
 
         if (roots.isEmpty()) return
 
+        // 避免在設定頁面誤觸
         for (r in roots) {
             if (isSafeScreen(r)) return
         }
 
-        // 專屬功能：完整快取中 -> 點擊左上角 ←
+        // =========================================================
+        // 【獨立專屬永久功能】：若出現「完整快取中」則自動點擊左上角 ←
+        // =========================================================
         for (r in roots) {
             if (checkAndHandleCachingScreen(r)) {
                 return
             }
         }
 
-        // 純精準比對：尋找關閉按鈕，絕不盲點
+        // =========================================================
+        // 【純精準比對，絕不盲點】：尋找符合條件的實體元件
+        // =========================================================
         for (r in roots) {
             if (scanAndClickNodes(r)) {
                 break
@@ -229,11 +213,18 @@ class AutoClickService : AccessibilityService() {
         return false
     }
 
+    /**
+     * 精準元件掃描：
+     * 1. 文字/標籤特徵符合
+     * 2. View ID 符合
+     * 3. 針對無文字圖片叉叉（Unity Ads）：尺寸小於 180px 且位於卡片頂部角落的可點擊小元件
+     */
     private fun scanAndClickNodes(node: AccessibilityNodeInfo): Boolean {
         val text = node.text?.toString()?.trim() ?: ""
         val desc = node.contentDescription?.toString()?.trim() ?: ""
         val viewId = node.viewIdResourceName?.lowercase() ?: ""
 
+        // 1. 文字特徵比對
         for (pattern in CLOSE_PATTERNS) {
             if (isMatchingPattern(text, pattern) || isMatchingPattern(desc, pattern)) {
                 if (performGestureClick(node)) {
@@ -243,10 +234,29 @@ class AutoClickService : AccessibilityService() {
             }
         }
 
+        // 2. 元件 ID 比對
         if (viewId.contains("close") || viewId.contains("skip") || viewId.contains("dismiss")) {
             if (performGestureClick(node)) {
                 showAlwaysToast("⚡ 點擊關閉元件")
                 return true
+            }
+        }
+
+        // 3. 純圖片型卡片角落叉叉精準辨識（針對 Unity Ads 圓角卡片右/左上角的無文字小按鈕）
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        val (screenWidth, screenHeight) = getRealScreenSize()
+
+        if (screenWidth > 0 && screenHeight > 0) {
+            val isSmallButton = rect.width() in 20..180 && rect.height() in 20..180
+            val isTopCorner = rect.top < screenHeight * 0.20f && 
+                              (rect.right > screenWidth * 0.80f || rect.left < screenWidth * 0.20f)
+
+            if (isSmallButton && isTopCorner && node.isClickable) {
+                if (performGestureClick(node)) {
+                    showAlwaysToast("⚡ 精準點擊角落關閉元件")
+                    return true
+                }
             }
         }
 
