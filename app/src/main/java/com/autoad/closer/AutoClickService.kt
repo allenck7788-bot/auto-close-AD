@@ -18,9 +18,9 @@ class AutoClickService : AccessibilityService() {
 
     companion object {
         var instance: AutoClickService? = null
-        private const val COOLDOWN_MS = 3000L // 3 秒冷卻防抖
+        private const val COOLDOWN_MS = 4000L // 4 秒安全冷卻
 
-        // 系統與日常絕對安全清單：在這些畫面中一律不進行任何動作
+        // 系統與日常絕對安全清單
         private val SAFE_PACKAGES = listOf(
             "settings",
             "launcher",
@@ -32,7 +32,7 @@ class AutoClickService : AccessibilityService() {
 
     private var lastActionTime = 0L
 
-    // 關閉與快進特徵清單（含 >>, ⏯, ✕, 關閉等）
+    // 關閉與快進特徵清單
     private val CLOSE_PATTERNS = listOf(
         "✕", "×", "✖", "X", "x",
         "⏯", "▶|", "|▶", ">>", "»", ">", "⏩",
@@ -43,7 +43,7 @@ class AutoClickService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
-        showToast("AutoAdCloser 已啟動 (已支援左上+右上雙邊隨機圖示)")
+        showToast("AutoAdCloser 已啟動 (已開啟每 4 秒偵測狀態提示)")
     }
 
     override fun onDestroy() {
@@ -59,7 +59,7 @@ class AutoClickService : AccessibilityService() {
             return
         }
 
-        // 1. 安全防護：檢查當前 App 是否在系統設定或桌面清單內
+        // 1. 安全防護：系統設定或日常介面不動作
         val pkg = event.packageName?.toString()?.lowercase() ?: ""
         for (safe in SAFE_PACKAGES) {
             if (pkg.contains(safe)) {
@@ -70,15 +70,19 @@ class AutoClickService : AccessibilityService() {
         try {
             val root = rootInActiveWindow ?: event.source ?: return
 
-            // 2. 自身頁面熔斷保護
+            // 2. 自家 App 介面熔斷保護
             if (isSafeScreen(root)) {
                 return
             }
 
-            // 3. 優先尋找帶有符號/文字的精準節點（並以「實體座標手勢」點擊）
+            // 3. 執行輪詢心跳提示（讓你知道程式正在運作中）
+            lastActionTime = currentTime
+            showToast("🔍 偵測廣告中...")
+
+            // 4. 優先嘗試比對文字/符號節點
             val clicked = scanAndClickNodes(root)
 
-            // 4. 若為無文字廣告（純 Canvas 貼圖的 ⏯ 或 ✕），且畫面帶有廣告下載特徵，依序發動左上與右上熱區手勢
+            // 5. 若為純貼圖/無文字按鈕，但畫面包含廣告特徵（如 Learn More、安裝等），發動雙角落手勢
             if (!clicked && isAdScreenWithActionBtn(root)) {
                 triggerCornerAdHotspots()
             }
@@ -106,14 +110,17 @@ class AutoClickService : AccessibilityService() {
     }
 
     /**
-     * 檢查畫面是否處於廣告結算/試玩中（例如出現「安裝」、「開始遊戲」、「立即購買」等按鈕）
+     * 檢查是否帶有廣告標籤特徵（加入 Learn More、搶購、PChome 等商業廣告特徵）
      */
     private fun isAdScreenWithActionBtn(node: AccessibilityNodeInfo): Boolean {
-        val adBtnKeywords = listOf("安裝", "开始游戏", "開始遊戲", "立即購買", "立即下载", "Download", "Install")
-        val text = node.text?.toString() ?: ""
-        val desc = node.contentDescription?.toString() ?: ""
+        val adKeywords = listOf(
+            "learn more", "install", "download", "play",
+            "安裝", "开始游戏", "開始遊戲", "立即購買", "立即下载", "搶購", "優惠"
+        )
+        val text = node.text?.toString()?.lowercase() ?: ""
+        val desc = node.contentDescription?.toString()?.lowercase() ?: ""
 
-        for (kw in adBtnKeywords) {
+        for (kw in adKeywords) {
             if (text.contains(kw) || desc.contains(kw)) {
                 return true
             }
@@ -126,13 +133,7 @@ class AutoClickService : AccessibilityService() {
         return false
     }
 
-    /**
-     * 掃描可見節點並強制以「實體螢幕座標手勢」點擊按鈕中心
-     */
     private fun scanAndClickNodes(node: AccessibilityNodeInfo): Boolean {
-        val currentTime = System.currentTimeMillis()
-        if (currentTime - lastActionTime < COOLDOWN_MS) return true
-
         val text = node.text?.toString()?.trim() ?: ""
         val desc = node.contentDescription?.toString()?.trim() ?: ""
         val viewId = node.viewIdResourceName?.lowercase() ?: ""
@@ -141,8 +142,7 @@ class AutoClickService : AccessibilityService() {
         for (pattern in CLOSE_PATTERNS) {
             if (isMatchingPattern(text, pattern) || isMatchingPattern(desc, pattern)) {
                 if (performGestureClick(node)) {
-                    lastActionTime = System.currentTimeMillis()
-                    showToast("⚡ 手勢點擊：$pattern")
+                    showToast("⚡ 已點擊：$pattern")
                     return true
                 }
             }
@@ -151,19 +151,15 @@ class AutoClickService : AccessibilityService() {
         // 2. View ID 比對
         if (viewId.contains("close") || viewId.contains("skip") || viewId.contains("dismiss")) {
             if (performGestureClick(node)) {
-                lastActionTime = System.currentTimeMillis()
-                showToast("⚡ 手勢點擊：廣告按鈕")
+                showToast("⚡ 已點擊廣告按鈕元件")
                 return true
             }
         }
 
         // 3. 遞迴子元件
         for (i in 0 until node.childCount) {
-            try {
-                if (System.currentTimeMillis() - lastActionTime < COOLDOWN_MS) return true
-                val child = node.getChild(i) ?: continue
-                if (scanAndClickNodes(child)) return true
-            } catch (_: Exception) {}
+            val child = node.getChild(i) ?: continue
+            if (scanAndClickNodes(child)) return true
         }
 
         return false
@@ -178,15 +174,12 @@ class AutoClickService : AccessibilityService() {
         }
     }
 
-    /**
-     * 計算實體位置派發觸控手勢（GestureDescription），防止廣告 SDK 阻擋軟體點擊
-     */
     private fun performGestureClick(node: AccessibilityNodeInfo): Boolean {
         val rect = Rect()
         node.getBoundsInScreen(rect)
 
-        // 過濾掉全螢幕的大容器，只點擊按鈕尺寸（長寬小於 350px 且大於 10px）
-        if (rect.width() in 10..350 && rect.height() in 10..350) {
+        // 針對按鈕區域做點擊
+        if (rect.width() in 10..380 && rect.height() in 10..380) {
             clickAt(rect.centerX().toFloat(), rect.centerY().toFloat())
             return true
         }
@@ -194,7 +187,7 @@ class AutoClickService : AccessibilityService() {
     }
 
     /**
-     * 支援直向與橫向：雙角落（左上 + 右上）實體熱區手勢點擊
+     * 雙角落（右上 + 左上）熱區點擊（針對照片中圓形灰色叉叉位置精準補刀）
      */
     private fun triggerCornerAdHotspots() {
         val (width, height) = getRealScreenSize()
@@ -202,21 +195,20 @@ class AutoClickService : AccessibilityService() {
 
         val isLandscape = width > height
 
-        // 根據直橫向計算左上角與右上角座標比例
-        val leftX = if (isLandscape) width * 0.065f else width * 0.085f
-        val rightX = if (isLandscape) width * 0.935f else width * 0.915f
-        val topY = if (isLandscape) height * 0.085f else height * 0.088f
+        // 根據直橫向微調，針對照片中的右上角叉叉比例（X 約 89.5%, Y 約 9.2%）
+        val rightX = if (isLandscape) width * 0.935f else width * 0.895f
+        val leftX = if (isLandscape) width * 0.065f else width * 0.095f
+        val topY = if (isLandscape) height * 0.085f else height * 0.092f
 
-        // 1. 先點擊左上角熱區
-        clickAt(leftX, topY)
+        // 1. 優先點擊右上角
+        clickAt(rightX, topY)
 
-        // 2. 延遲 350ms 接著點擊右上角熱區，兼顧隨機出現在兩側的按鈕
+        // 2. 延遲 300ms 點擊左上角，兼顧左右隨機按鈕
         Handler(Looper.getMainLooper()).postDelayed({
-            clickAt(rightX, topY)
-        }, 350L)
+            clickAt(leftX, topY)
+        }, 300L)
 
-        lastActionTime = System.currentTimeMillis()
-        showToast("⚡ 已點擊雙邊角落按鈕熱區")
+        showToast("⚡ 已執行角落按鈕點擊")
     }
 
     private fun clickAt(x: Float, y: Float) {
