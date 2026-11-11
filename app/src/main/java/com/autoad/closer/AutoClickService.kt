@@ -26,7 +26,6 @@ class AutoClickService : AccessibilityService() {
     companion object {
         var instance: AutoClickService? = null
         private const val CHECK_INTERVAL_MS = 3500L // 3.5 秒定時巡檢
-        private const val DELAY_CLICK_MS = 5000L   // 延遲 5 秒後再點擊關閉
 
         // 系統安全清單
         private val SYSTEM_SAFE_PACKAGES = listOf(
@@ -42,7 +41,7 @@ class AutoClickService : AccessibilityService() {
     private var audioManager: AudioManager? = null
     private var windowManager: WindowManager? = null
 
-    // 常規文字與符號特徵清單（維持不變）
+    // 常規文字與符號特徵清單
     private val CLOSE_PATTERNS = listOf(
         "✕", "×", "✖", "X", "x",
         "⏯", "▶|", "|▶",
@@ -144,7 +143,7 @@ class AutoClickService : AccessibilityService() {
         }
 
         // =========================================================
-        // 【獨立專屬永久功能】：若出現「完整快取中」則自動點擊左上角 ←（維持原樣）
+        // 【獨立專屬永久功能】：若出現「完整快取中」則自動點擊左上角 ←
         // =========================================================
         for (r in roots) {
             if (checkAndHandleCachingScreen(r)) {
@@ -153,7 +152,7 @@ class AutoClickService : AccessibilityService() {
         }
 
         // =========================================================
-        // 【純精準比對】：尋找符合條件的關閉按鈕（維持原樣）
+        // 【純精準比對】：尋找符合條件的關閉按鈕
         // =========================================================
         for (r in roots) {
             if (scanAndClickNodes(r)) {
@@ -254,7 +253,7 @@ class AutoClickService : AccessibilityService() {
     }
 
     /**
-     * 掃描元件（完全維持上一版經實測證實有效的辨識邏輯）
+     * 掃描元件：加入左上角漢堡選單 (≡) 排除白名單
      */
     private fun scanAndClickNodes(node: AccessibilityNodeInfo): Boolean {
         val rect = Rect()
@@ -269,18 +268,31 @@ class AutoClickService : AccessibilityService() {
             val isTopRightSpot = isTopZone && (centerXRatio in 0.75f..0.98f)
             val isTopLeftSpot = isTopZone && (centerXRatio in 0.02f..0.22f)
 
+            // 避開主頁頂部導航列中右功能區 (Y < 12%, X 在 50%~85% 之間)
             val isInTopNavBarFunctionZone = centerYRatio < 0.12f && centerXRatio in 0.50f..0.85f
 
-            if (!isInTopNavBarFunctionZone && (isTopRightSpot || isTopLeftSpot)) {
-                val text = node.text?.toString()?.trim() ?: ""
-                val desc = node.contentDescription?.toString()?.trim() ?: ""
-                val viewId = node.viewIdResourceName?.lowercase() ?: ""
+            val text = node.text?.toString()?.trim() ?: ""
+            val desc = node.contentDescription?.toString()?.trim() ?: ""
+            val viewId = node.viewIdResourceName?.lowercase() ?: ""
 
+            // 【核心防護 1】：嚴格排除左上角三條線漢堡選單 (≡ / Menu / Drawer)
+            val isHamburgerMenu = text == "≡" || desc == "≡" || text.contains("≡") || desc.contains("≡") ||
+                    desc.contains("menu", ignoreCase = true) || desc.contains("drawer", ignoreCase = true) ||
+                    desc.contains("選單", ignoreCase = true) || desc.contains("菜单", ignoreCase = true) ||
+                    desc.contains("導航", ignoreCase = true) || desc.contains("navigation", ignoreCase = true) ||
+                    viewId.contains("menu") || viewId.contains("drawer")
+
+            if (isHamburgerMenu) {
+                return false
+            }
+
+            if (!isInTopNavBarFunctionZone && (isTopRightSpot || isTopLeftSpot)) {
                 // 1. 文字/符號比對
                 for (pattern in CLOSE_PATTERNS) {
                     if (isMatchingPattern(text, pattern) || isMatchingPattern(desc, pattern)) {
                         if (performGestureClick(node)) {
-                            showAlwaysToast("⚡ 偵測到關閉按鈕：$pattern (等待5秒後點擊)")
+                            val sec = getClickDelaySec()
+                            showAlwaysToast("⚡ 偵測到關閉按鈕：$pattern (等待${sec}秒後點擊)")
                             return true
                         }
                     }
@@ -289,12 +301,13 @@ class AutoClickService : AccessibilityService() {
                 // 2. 元件 ID 比對
                 if (viewId.contains("close") || viewId.contains("skip") || viewId.contains("dismiss") || viewId.contains("btn_close")) {
                     if (performGestureClick(node)) {
-                        showAlwaysToast("⚡ 偵測到關閉元件 (等待5秒後點擊)")
+                        val sec = getClickDelaySec()
+                        showAlwaysToast("⚡ 偵測到關閉元件 (等待${sec}秒後點擊)")
                         return true
                     }
                 }
 
-                // 3. Unity Ads 卡片右上角微型按鈕比對
+                // 3. Unity Ads 卡片右上角微型按鈕比對（排除左上角無文字元件，防止誤觸三條線漢堡圖）
                 val widthRatio = rect.width().toFloat() / screenWidth
                 val heightRatio = rect.height().toFloat() / screenHeight
                 val isButtonProportion = (widthRatio in 0.025f..0.18f) && (heightRatio in 0.015f..0.14f)
@@ -302,9 +315,11 @@ class AutoClickService : AccessibilityService() {
                 val aspectRatio = if (rect.height() > 0) rect.width().toFloat() / rect.height().toFloat() else 0f
                 val isSquareOrCircle = aspectRatio in 0.50f..1.90f
 
-                if (isButtonProportion && isSquareOrCircle) {
+                // 純幾何判定僅套用於「右上角」按鈕，左上角若無文字絕對不盲點
+                if (isTopRightSpot && isButtonProportion && isSquareOrCircle) {
                     if (performGestureClick(node)) {
-                        showAlwaysToast("⚡ 鎖定關閉按鈕 (等待5秒後點擊)")
+                        val sec = getClickDelaySec()
+                        showAlwaysToast("⚡ 鎖定關閉按鈕 (等待${sec}秒後點擊)")
                         return true
                     }
                 }
@@ -328,8 +343,15 @@ class AutoClickService : AccessibilityService() {
     }
 
     /**
-     * 【本次核心改動】：
-     * 辨識成功後，在圖示下方持續顯示「▲ 關閉！」警示，並等待 5 秒後才執行真實點擊
+     * 讀取使用者自訂的等待秒數（預設 8 秒）
+     */
+    private fun getClickDelaySec(): Int {
+        val sp = getSharedPreferences("autoad_prefs", Context.MODE_PRIVATE)
+        return sp.getInt("click_delay_sec", 8)
+    }
+
+    /**
+     * 手勢延遲執行：依使用者選擇的秒數進行動態倒數與標籤提示
      */
     private fun performGestureClick(node: AccessibilityNodeInfo): Boolean {
         val rect = Rect()
@@ -345,19 +367,20 @@ class AutoClickService : AccessibilityService() {
         val clickX = rect.centerX().toFloat()
         val clickY = rect.centerY().toFloat()
 
-        // 鎖定狀態，防止 5 秒等待期間重複觸發
         isActionPending = true
 
-        // 1. 在按鈕正下方緊貼顯示「▲ 關閉！」，展示 5500 毫秒（全程陪伴倒數）
-        showDebugMarkerUnderButton(rect, 5500L)
+        val delaySec = getClickDelaySec()
+        val delayMillis = delaySec * 1000L
 
-        // 2. 原地等待 5 秒後再執行真實點擊
+        // 標籤展示時間為倒數時間加 500 毫秒，維持全程陪伴提示
+        showDebugMarkerUnderButton(rect, "▲ 關閉！ (${delaySec}秒)", delayMillis + 500L)
+
         mainHandler.postDelayed({
             if (isServiceRunning) {
                 dispatchClick(clickX, clickY)
             }
             isActionPending = false
-        }, DELAY_CLICK_MS)
+        }, delayMillis)
 
         return true
     }
@@ -375,17 +398,17 @@ class AutoClickService : AccessibilityService() {
     }
 
     /**
-     * 在偵測到的關閉圖示「正下方貼近位置」持續顯示紅底白字「▲ 關閉！」
+     * 在按鈕下方顯示紅底白字「▲ 關閉！ (X秒)」
      */
-    private fun showDebugMarkerUnderButton(buttonRect: Rect, displayDurationMs: Long = 5500L) {
+    private fun showDebugMarkerUnderButton(buttonRect: Rect, labelText: String, displayDurationMs: Long) {
         mainHandler.post {
             val wm = windowManager ?: return@post
             try {
                 val markView = TextView(applicationContext).apply {
-                    text = "▲ 關閉！"
+                    text = labelText
                     setTextColor(Color.WHITE)
                     textSize = 12f
-                    setBackgroundColor(Color.parseColor("#E53935")) // 亮紅底色
+                    setBackgroundColor(Color.parseColor("#E53935"))
                     setPadding(12, 4, 12, 4)
                 }
 
@@ -397,13 +420,11 @@ class AutoClickService : AccessibilityService() {
 
                 val (screenWidth, _) = getRealScreenSize()
 
-                // 水平對齊按鈕中心
                 var targetX = buttonRect.centerX() - (markWidth / 2)
                 if (screenWidth > 0) {
                     targetX = targetX.coerceIn(8, screenWidth - markWidth - 8)
                 }
 
-                // 垂直緊貼按鈕下緣
                 val targetY = buttonRect.bottom + 2
 
                 val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
