@@ -18,7 +18,7 @@ class AutoClickService : AccessibilityService() {
 
     companion object {
         var instance: AutoClickService? = null
-        private const val CHECK_INTERVAL_MS = 4000L // 強制固定每 4 秒主動偵測一次
+        private const val CHECK_INTERVAL_MS = 4000L // 每 4 秒定時偵測
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -32,7 +32,6 @@ class AutoClickService : AccessibilityService() {
         "Close", "close", "SKIP", "Skip", "skip"
     )
 
-    // 閉環定時任務：每次跑完保證排程下一次，永不中斷
     private val inspectionRunnable = object : Runnable {
         override fun run() {
             if (!isServiceRunning) return
@@ -42,7 +41,6 @@ class AutoClickService : AccessibilityService() {
             } catch (e: Exception) {
                 e.printStackTrace()
             } finally {
-                // 無論中間發生任何狀況，4 秒後絕對再次執行
                 mainHandler.postDelayed(this, CHECK_INTERVAL_MS)
             }
         }
@@ -53,9 +51,8 @@ class AutoClickService : AccessibilityService() {
         instance = this
         isServiceRunning = true
 
-        showToast("AutoAdCloser 服務已連線！(已啟動每 4 秒強制定時)")
+        showToast("AutoAdCloser 服務已連線！(支援左右隨機細叉)")
 
-        // 立即啟動不中斷的每 4 秒定時循環
         mainHandler.removeCallbacks(inspectionRunnable)
         mainHandler.postDelayed(inspectionRunnable, 1000L)
     }
@@ -68,16 +65,12 @@ class AutoClickService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // 系統事件照常接收，但不依賴它做定時
+        // 系統事件照常監聽
     }
 
     override fun onInterrupt() {}
 
-    /**
-     * 核心偵測流程
-     */
     private fun processCurrentScreen() {
-        // 1. 取得所有層級視窗
         val roots = mutableListOf<AccessibilityNodeInfo>()
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
@@ -93,22 +86,21 @@ class AutoClickService : AccessibilityService() {
 
         if (roots.isEmpty()) return
 
-        // 2. 自家 App 與系統設定頁安全防護（避免誤按到開關）
+        // 自家與設定頁防護
         for (r in roots) {
             if (isSafeScreen(r)) return
         }
 
-        // 3. 固定跳出提示：證明此定時器 100% 正常活著！
         showToast("🔍 正在偵測廣告...")
 
-        // 4. 文字/符號節點掃描
+        // 1. 優先文字/符號節點掃描
         for (r in roots) {
             if (scanAndClickNodes(r)) {
                 return
             }
         }
 
-        // 5. 若為試玩廣告或含下載特徵的廣告，發動雙邊熱區點擊
+        // 2. 針對試玩或帶有廣告特徵畫面發動左右雙向四點補刀
         for (r in roots) {
             if (isPlayableOrAdScreen(r)) {
                 triggerPlayableCornerHotspots()
@@ -181,6 +173,7 @@ class AutoClickService : AccessibilityService() {
             val child = node.getChild(i) ?: continue
             if (scanAndClickNodes(child)) return true
         }
+
         return false
     }
 
@@ -204,31 +197,33 @@ class AutoClickService : AccessibilityService() {
         return false
     }
 
+    /**
+     * 支援直向/橫向，全面覆蓋左右兩側隨機出現的細叉（內縮金幣位 + 極限邊角位）
+     */
     private fun triggerPlayableCornerHotspots() {
         val (width, height) = getRealScreenSize()
         if (width <= 0 || height <= 0) return
 
         val isLandscape = width > height
 
-        val playableRightX = if (isLandscape) width * 0.90f else width * 0.835f
-        val standardRightX = if (isLandscape) width * 0.94f else width * 0.910f
-        val leftX = if (isLandscape) width * 0.07f else width * 0.085f
+        // 1. 金幣旁內縮細叉（右側與左側對稱）
+        val innerRightX = if (isLandscape) width * 0.90f else width * 0.835f
+        val innerLeftX  = if (isLandscape) width * 0.10f else width * 0.165f
+
+        // 2. 常規邊緣極限角（右側與左側）
+        val outerRightX = if (isLandscape) width * 0.94f else width * 0.910f
+        val outerLeftX  = if (isLandscape) width * 0.06f else width * 0.085f
+
         val topY = if (isLandscape) height * 0.08f else height * 0.065f
 
-        // 1. 優先戳金幣旁的位置
-        clickAt(playableRightX, topY)
+        // 點擊順序：右內縮 -> 左內縮 -> 右極限 -> 左極限
+        clickAt(innerRightX, topY)
 
-        // 2. 補點常規右上角
-        mainHandler.postDelayed({
-            clickAt(standardRightX, topY)
-        }, 300L)
+        mainHandler.postDelayed({ clickAt(innerLeftX, topY) }, 200L)
+        mainHandler.postDelayed({ clickAt(outerRightX, topY) }, 400L)
+        mainHandler.postDelayed({ clickAt(outerLeftX, topY) }, 600L)
 
-        // 3. 補點左上角
-        mainHandler.postDelayed({
-            clickAt(leftX, topY)
-        }, 600L)
-
-        showToast("⚡ 已點擊試玩關閉熱區")
+        showToast("⚡ 已點擊雙向隨機關閉熱區")
     }
 
     private fun clickAt(x: Float, y: Float) {
