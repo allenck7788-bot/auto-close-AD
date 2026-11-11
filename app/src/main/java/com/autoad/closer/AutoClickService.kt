@@ -18,7 +18,7 @@ class AutoClickService : AccessibilityService() {
 
     companion object {
         var instance: AutoClickService? = null
-        private const val COOLDOWN_MS = 4000L // 維持強制 4 秒冷卻，避免頻繁點擊
+        private const val COOLDOWN_MS = 4000L // 維持強制 4 秒冷卻防卡頓
     }
 
     private var lastActionTime = 0L
@@ -26,7 +26,7 @@ class AutoClickService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
-        showToast("AutoAdCloser 增強版已啟動 (支援圓形圖標廣告)")
+        showToast("AutoAdCloser 已啟動 (支援直/橫向 左上+右上 雙角落關閉)")
     }
 
     override fun onDestroy() {
@@ -45,10 +45,10 @@ class AutoClickService : AccessibilityService() {
         try {
             val root = rootInActiveWindow ?: event.source ?: return
             
-            // 1. 優先嘗試比對文字節點與按鈕 ID
+            // 1. 優先掃描帶有文字或 ID 的關閉節點
             val handled = scanAndClickNodes(root)
             
-            // 2. 若無文字節點（純圖形圓形叉叉廣告），進行常見廣告右上角盲猜點擊
+            // 2. 若全為圖片/畫布渲染（無文字節點），發動直橫向「右上 + 左上」雙角落熱區點擊
             if (!handled) {
                 checkAndClickAdCornerHotspots()
             }
@@ -71,7 +71,6 @@ class AutoClickService : AccessibilityService() {
         val desc = node.contentDescription?.toString() ?: ""
         val viewId = node.viewIdResourceName?.lowercase() ?: ""
 
-        // 比對常見關鍵字或 View ID
         for (kw in closeKeywords) {
             if (text == kw || desc == kw || (kw.length > 1 && (text.contains(kw) || desc.contains(kw)))) {
                 if (performClickOnNode(node)) {
@@ -102,19 +101,29 @@ class AutoClickService : AccessibilityService() {
     }
 
     /**
-     * 針對純圖片/無文字圖示（如右上角白底黑叉圓形按鈕）的熱區點擊
+     * 支援直立與橫向螢幕：自動取得即時邊界，並輪流點擊右上與左上熱區
      */
     private fun checkAndClickAdCornerHotspots() {
         val (width, height) = getRealScreenSize()
         if (width <= 0 || height <= 0) return
 
-        // 判斷按鈕在右上角 (如截圖中的位置：X 約 93%, Y 約 8%)
-        val targetX = width * 0.935f
-        val targetY = height * 0.085f
+        // 依據螢幕直橫向動態微調點擊邊距比例
+        val isLandscape = width > height
 
-        clickAt(targetX, targetY)
+        val rightX = if (isLandscape) width * 0.935f else width * 0.915f
+        val leftX = if (isLandscape) width * 0.065f else width * 0.085f
+        val topY = if (isLandscape) height * 0.085f else height * 0.055f
+
+        // 1. 點擊右上角
+        clickAt(rightX, topY)
+
+        // 2. 延遲 300ms 補充點擊左上角（防止按鈕隨機擺放在左側）
+        Handler(Looper.getMainLooper()).postDelayed({
+            clickAt(leftX, topY)
+        }, 300L)
+
         lastActionTime = System.currentTimeMillis()
-        showToast("⚡ 自動點擊：右上角關閉熱區")
+        showToast("⚡ 已點擊雙邊角落關閉熱區")
     }
 
     private fun performClickOnNode(node: AccessibilityNodeInfo): Boolean {
