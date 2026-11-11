@@ -25,9 +25,10 @@ class AutoClickService : AccessibilityService() {
 
     companion object {
         var instance: AutoClickService? = null
-        private const val CHECK_INTERVAL_MS = 3500L // 每 3.5 秒定時巡檢
+        private const val CHECK_INTERVAL_MS = 3500L // 3.5 秒定時巡檢
+        private const val DELAY_CLICK_MS = 5000L   // 延遲 5 秒後再點擊關閉
 
-        // 系統安全清單：設定、輸入法不點擊
+        // 系統安全清單
         private val SYSTEM_SAFE_PACKAGES = listOf(
             "settings",
             "inputmethod",
@@ -41,7 +42,7 @@ class AutoClickService : AccessibilityService() {
     private var audioManager: AudioManager? = null
     private var windowManager: WindowManager? = null
 
-    // 常規文字與符號特徵清單
+    // 常規文字與符號特徵清單（維持不變）
     private val CLOSE_PATTERNS = listOf(
         "✕", "×", "✖", "X", "x",
         "⏯", "▶|", "|▶",
@@ -100,9 +101,6 @@ class AutoClickService : AccessibilityService() {
         stopAllTasks()
     }
 
-    /**
-     * 徹底停止所有定時與背景排程，杜絕殭屍定時器
-     */
     private fun stopAllTasks() {
         isServiceRunning = false
         isActionPending = false
@@ -146,7 +144,7 @@ class AutoClickService : AccessibilityService() {
         }
 
         // =========================================================
-        // 【獨立專屬永久功能】：若出現「完整快取中」則自動點擊左上角 ←
+        // 【獨立專屬永久功能】：若出現「完整快取中」則自動點擊左上角 ←（維持原樣）
         // =========================================================
         for (r in roots) {
             if (checkAndHandleCachingScreen(r)) {
@@ -155,7 +153,7 @@ class AutoClickService : AccessibilityService() {
         }
 
         // =========================================================
-        // 【純精準比對，絕不盲點】：向下完整遍歷子節點並嚴格限制點擊範圍
+        // 【純精準比對】：尋找符合條件的關閉按鈕（維持原樣）
         // =========================================================
         for (r in roots) {
             if (scanAndClickNodes(r)) {
@@ -256,7 +254,7 @@ class AutoClickService : AccessibilityService() {
     }
 
     /**
-     * 掃描元件：完整向下遞迴搜尋子葉節點，並只對符合頂部角落條件的微型按鈕觸發點擊
+     * 掃描元件（完全維持上一版經實測證實有效的辨識邏輯）
      */
     private fun scanAndClickNodes(node: AccessibilityNodeInfo): Boolean {
         val rect = Rect()
@@ -267,12 +265,10 @@ class AutoClickService : AccessibilityService() {
             val centerYRatio = rect.centerY().toFloat() / screenHeight
             val centerXRatio = rect.centerX().toFloat() / screenWidth
 
-            // 【嚴格點擊守衛】：只有真正落在頂部 25% 且在兩側角落的微型實體元件才允許比對點擊
             val isTopZone = centerYRatio in 0.02f..0.25f
             val isTopRightSpot = isTopZone && (centerXRatio in 0.75f..0.98f)
             val isTopLeftSpot = isTopZone && (centerXRatio in 0.02f..0.22f)
 
-            // 避開主頁頂部導航列中右功能區 (Y < 12%, X 在 50%~85% 之間)
             val isInTopNavBarFunctionZone = centerYRatio < 0.12f && centerXRatio in 0.50f..0.85f
 
             if (!isInTopNavBarFunctionZone && (isTopRightSpot || isTopLeftSpot)) {
@@ -280,11 +276,11 @@ class AutoClickService : AccessibilityService() {
                 val desc = node.contentDescription?.toString()?.trim() ?: ""
                 val viewId = node.viewIdResourceName?.lowercase() ?: ""
 
-                // 1. 文字/符號特徵比對
+                // 1. 文字/符號比對
                 for (pattern in CLOSE_PATTERNS) {
                     if (isMatchingPattern(text, pattern) || isMatchingPattern(desc, pattern)) {
                         if (performGestureClick(node)) {
-                            showAlwaysToast("⚡ 點擊關閉按鈕：$pattern")
+                            showAlwaysToast("⚡ 偵測到關閉按鈕：$pattern (等待5秒後點擊)")
                             return true
                         }
                     }
@@ -293,12 +289,12 @@ class AutoClickService : AccessibilityService() {
                 // 2. 元件 ID 比對
                 if (viewId.contains("close") || viewId.contains("skip") || viewId.contains("dismiss") || viewId.contains("btn_close")) {
                     if (performGestureClick(node)) {
-                        showAlwaysToast("⚡ 點擊關閉元件")
+                        showAlwaysToast("⚡ 偵測到關閉元件 (等待5秒後點擊)")
                         return true
                     }
                 }
 
-                // 3. 【純幾何角落按鈕精準鎖定】：針對 Unity Ads 卡片右上角的微型方形/圓形叉叉
+                // 3. Unity Ads 卡片右上角微型按鈕比對
                 val widthRatio = rect.width().toFloat() / screenWidth
                 val heightRatio = rect.height().toFloat() / screenHeight
                 val isButtonProportion = (widthRatio in 0.025f..0.18f) && (heightRatio in 0.015f..0.14f)
@@ -308,14 +304,13 @@ class AutoClickService : AccessibilityService() {
 
                 if (isButtonProportion && isSquareOrCircle) {
                     if (performGestureClick(node)) {
-                        showAlwaysToast("⚡ 精準鎖定角落關閉按鈕")
+                        showAlwaysToast("⚡ 鎖定關閉按鈕 (等待5秒後點擊)")
                         return true
                     }
                 }
             }
         }
 
-        // 務必遞迴搜尋所有子節點（絕不能在大容器中心點過大時中斷）
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
             if (scanAndClickNodes(child)) return true
@@ -332,6 +327,10 @@ class AutoClickService : AccessibilityService() {
         }
     }
 
+    /**
+     * 【本次核心改動】：
+     * 辨識成功後，在圖示下方持續顯示「▲ 關閉！」警示，並等待 5 秒後才執行真實點擊
+     */
     private fun performGestureClick(node: AccessibilityNodeInfo): Boolean {
         val rect = Rect()
         node.getBoundsInScreen(rect)
@@ -339,7 +338,6 @@ class AutoClickService : AccessibilityService() {
         val (screenWidth, screenHeight) = getRealScreenSize()
         if (screenWidth <= 0 || screenHeight <= 0) return false
 
-        // 防禦：按鈕絕不可超過螢幕 35% 寬度（嚴防按中整張卡片）
         if (rect.width() > screenWidth * 0.35f || rect.centerY() > screenHeight * 0.25f) {
             return false
         }
@@ -347,20 +345,20 @@ class AutoClickService : AccessibilityService() {
         val clickX = rect.centerX().toFloat()
         val clickY = rect.centerY().toFloat()
 
-        if (isDebugModeEnabled()) {
-            isActionPending = true
-            showDebugMarkerUnderButton(rect, 3500L)
-            showAlwaysToast("🛠️ 除錯中：已鎖定按鈕，3 秒後執行點擊...")
+        // 鎖定狀態，防止 5 秒等待期間重複觸發
+        isActionPending = true
 
-            mainHandler.postDelayed({
-                if (isServiceRunning) {
-                    dispatchClick(clickX, clickY)
-                }
-                isActionPending = false
-            }, 3000L)
-        } else {
-            dispatchClick(clickX, clickY)
-        }
+        // 1. 在按鈕正下方緊貼顯示「▲ 關閉！」，展示 5500 毫秒（全程陪伴倒數）
+        showDebugMarkerUnderButton(rect, 5500L)
+
+        // 2. 原地等待 5 秒後再執行真實點擊
+        mainHandler.postDelayed({
+            if (isServiceRunning) {
+                dispatchClick(clickX, clickY)
+            }
+            isActionPending = false
+        }, DELAY_CLICK_MS)
+
         return true
     }
 
@@ -376,7 +374,10 @@ class AutoClickService : AccessibilityService() {
         return sp.getBoolean("debug_mode", false)
     }
 
-    private fun showDebugMarkerUnderButton(buttonRect: Rect, displayDurationMs: Long = 1500L) {
+    /**
+     * 在偵測到的關閉圖示「正下方貼近位置」持續顯示紅底白字「▲ 關閉！」
+     */
+    private fun showDebugMarkerUnderButton(buttonRect: Rect, displayDurationMs: Long = 5500L) {
         mainHandler.post {
             val wm = windowManager ?: return@post
             try {
@@ -384,7 +385,7 @@ class AutoClickService : AccessibilityService() {
                     text = "▲ 關閉！"
                     setTextColor(Color.WHITE)
                     textSize = 12f
-                    setBackgroundColor(Color.parseColor("#E53935"))
+                    setBackgroundColor(Color.parseColor("#E53935")) // 亮紅底色
                     setPadding(12, 4, 12, 4)
                 }
 
@@ -396,11 +397,13 @@ class AutoClickService : AccessibilityService() {
 
                 val (screenWidth, _) = getRealScreenSize()
 
+                // 水平對齊按鈕中心
                 var targetX = buttonRect.centerX() - (markWidth / 2)
                 if (screenWidth > 0) {
                     targetX = targetX.coerceIn(8, screenWidth - markWidth - 8)
                 }
 
+                // 垂直緊貼按鈕下緣
                 val targetY = buttonRect.bottom + 2
 
                 val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
