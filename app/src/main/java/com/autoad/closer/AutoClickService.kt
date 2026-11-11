@@ -13,20 +13,18 @@ import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Toast
-import kotlinx.coroutines.*
 
 class AutoClickService : AccessibilityService() {
 
     companion object {
         var instance: AutoClickService? = null
-        private const val COOLDOWN_MS = 3000L // 3 秒冷卻
+        private const val CHECK_INTERVAL_MS = 4000L // 強制固定每 4 秒主動偵測一次
     }
 
-    private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var isServiceRunning = false
-    private var lastActionTime = 0L
 
-    // 特徵清單（含快進、關閉、X 符號）
+    // 關閉與快進特徵清單
     private val CLOSE_PATTERNS = listOf(
         "✕", "×", "✖", "X", "x",
         "⏯", "▶|", "|▶", ">>", "»", ">", "⏩",
@@ -34,86 +32,86 @@ class AutoClickService : AccessibilityService() {
         "Close", "close", "SKIP", "Skip", "skip"
     )
 
+    // 閉環定時任務：每次跑完保證排程下一次，永不中斷
+    private val inspectionRunnable = object : Runnable {
+        override fun run() {
+            if (!isServiceRunning) return
+
+            try {
+                processCurrentScreen()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            } finally {
+                // 無論中間發生任何狀況，4 秒後絕對再次執行
+                mainHandler.postDelayed(this, CHECK_INTERVAL_MS)
+            }
+        }
+    }
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
         isServiceRunning = true
-        showToast("AutoAdCloser 已啟動 (已開啟多視窗主動巡檢)")
-        
-        // 啟動主動輪詢循環（解決畫面靜止或分層彈窗不拋出事件的問題）
-        startActiveInspectionLoop()
+
+        showToast("AutoAdCloser 服務已連線！(已啟動每 4 秒強制定時)")
+
+        // 立即啟動不中斷的每 4 秒定時循環
+        mainHandler.removeCallbacks(inspectionRunnable)
+        mainHandler.postDelayed(inspectionRunnable, 1000L)
     }
 
     override fun onDestroy() {
         super.onDestroy()
         isServiceRunning = false
-        serviceScope.cancel()
+        mainHandler.removeCallbacks(inspectionRunnable)
         instance = null
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // 事件驅動觸發巡檢
-        inspectAndProcessScreen()
+        // 系統事件照常接收，但不依賴它做定時
     }
 
     override fun onInterrupt() {}
 
     /**
-     * 主動式每 3.5 秒定時巡檢，防止彈窗靜態卡死
+     * 核心偵測流程
      */
-    private fun startActiveInspectionLoop() {
-        serviceScope.launch {
-            while (isServiceRunning) {
-                delay(3500L)
-                inspectAndProcessScreen()
-            }
-        }
-    }
-
-    /**
-     * 核心多視窗分析流程
-     */
-    private fun inspectAndProcessScreen() {
-        val currentTime = System.currentTimeMillis()
-        if (currentTime - lastActionTime < COOLDOWN_MS) return
-
-        // 1. 取得目前螢幕上所有可互動的視窗（突破彈窗/分層盲點）
-        val allRoots = mutableListOf<AccessibilityNodeInfo>()
-        
+    private fun processCurrentScreen() {
+        // 1. 取得所有層級視窗
+        val roots = mutableListOf<AccessibilityNodeInfo>()
         try {
-            // 嘗試取得所有層級視窗（包含 Google Play 覆蓋層）
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                 windows?.forEach { win ->
-                    win.root?.let { allRoots.add(it) }
+                    win.root?.let { roots.add(it) }
                 }
             }
         } catch (_: Exception) {}
 
-        // 若無多視窗權限，回退使用根視窗
-        if (allRoots.isEmpty()) {
-            rootInActiveWindow?.let { allRoots.add(it) }
+        if (roots.isEmpty()) {
+            rootInActiveWindow?.let { roots.add(it) }
         }
 
-        if (allRoots.isEmpty()) return
+        if (roots.isEmpty()) return
 
-        // 2. 自身設定頁安全防護
-        for (root in allRoots) {
-            if (isSafeScreen(root)) return
+        // 2. 自家 App 與系統設定頁安全防護（避免誤按到開關）
+        for (r in roots) {
+            if (isSafeScreen(r)) return
         }
 
-        // 3. 逐層掃描所有視窗的文字與符號節點
-        for (root in allRoots) {
-            if (scanAndClickNodes(root)) {
-                lastActionTime = System.currentTimeMillis()
+        // 3. 固定跳出提示：證明此定時器 100% 正常活著！
+        showToast("🔍 正在偵測廣告...")
+
+        // 4. 文字/符號節點掃描
+        for (r in roots) {
+            if (scanAndClickNodes(r)) {
                 return
             }
         }
 
-        // 4. 若無文字節點，但畫面存在廣告特徵（如 Unity Ads、Play Now、安裝等），發動彈窗雙熱區盲點
-        for (root in allRoots) {
-            if (isAdScreenWithActionBtn(root)) {
-                lastActionTime = System.currentTimeMillis()
-                triggerCardCornerHotspots()
+        // 5. 若為試玩廣告或含下載特徵的廣告，發動雙邊熱區點擊
+        for (r in roots) {
+            if (isPlayableOrAdScreen(r)) {
+                triggerPlayableCornerHotspots()
                 return
             }
         }
@@ -137,18 +135,15 @@ class AutoClickService : AccessibilityService() {
         return false
     }
 
-    /**
-     * 檢查是否帶有廣告標籤特徵（加入 Unity Ads, Play Now, 安裝等）
-     */
-    private fun isAdScreenWithActionBtn(node: AccessibilityNodeInfo): Boolean {
-        val adKeywords = listOf(
-            "play now", "learn more", "install", "download", "unity ads",
-            "安裝", "开始游戏", "開始遊戲", "立即購買", "立即下载", "搶購", "優惠", "免費"
+    private fun isPlayableOrAdScreen(node: AccessibilityNodeInfo): Boolean {
+        val keywords = listOf(
+            "拖拽", "移動", "開始遊戲", "开始游戏",
+            "play now", "learn more", "install", "download", "安裝", "免費", "免费", "搶購"
         )
         val text = node.text?.toString()?.lowercase() ?: ""
         val desc = node.contentDescription?.toString()?.lowercase() ?: ""
 
-        for (kw in adKeywords) {
+        for (kw in keywords) {
             if (text.contains(kw) || desc.contains(kw)) {
                 return true
             }
@@ -156,7 +151,7 @@ class AutoClickService : AccessibilityService() {
 
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            if (isAdScreenWithActionBtn(child)) return true
+            if (isPlayableOrAdScreen(child)) return true
         }
         return false
     }
@@ -166,7 +161,6 @@ class AutoClickService : AccessibilityService() {
         val desc = node.contentDescription?.toString()?.trim() ?: ""
         val viewId = node.viewIdResourceName?.lowercase() ?: ""
 
-        // 比對精準符號與詞彙
         for (pattern in CLOSE_PATTERNS) {
             if (isMatchingPattern(text, pattern) || isMatchingPattern(desc, pattern)) {
                 if (performGestureClick(node)) {
@@ -176,7 +170,6 @@ class AutoClickService : AccessibilityService() {
             }
         }
 
-        // 比對常見 View ID
         if (viewId.contains("close") || viewId.contains("skip") || viewId.contains("dismiss")) {
             if (performGestureClick(node)) {
                 showToast("⚡ 手勢點擊：關閉元件")
@@ -188,7 +181,6 @@ class AutoClickService : AccessibilityService() {
             val child = node.getChild(i) ?: continue
             if (scanAndClickNodes(child)) return true
         }
-
         return false
     }
 
@@ -205,37 +197,38 @@ class AutoClickService : AccessibilityService() {
         val rect = Rect()
         node.getBoundsInScreen(rect)
 
-        if (rect.width() in 10..400 && rect.height() in 10..400) {
+        if (rect.width() in 10..450 && rect.height() in 10..450) {
             clickAt(rect.centerX().toFloat(), rect.centerY().toFloat())
             return true
         }
         return false
     }
 
-    /**
-     * 針對截圖中 Unity Ads 圓角卡片與 Google Play 彈窗量身微調的實體手勢座標
-     */
-    private fun triggerCardCornerHotspots() {
+    private fun triggerPlayableCornerHotspots() {
         val (width, height) = getRealScreenSize()
         if (width <= 0 || height <= 0) return
 
         val isLandscape = width > height
 
-        // 卡片右上角叉叉比例（直向約 89%, 橫向約 92%）
-        val rightX = if (isLandscape) width * 0.92f else width * 0.89f
-        // Google Play 安裝彈窗左上角叉叉比例
-        val leftX = if (isLandscape) width * 0.08f else width * 0.09f
-        val topY = if (isLandscape) height * 0.085f else height * 0.09f
+        val playableRightX = if (isLandscape) width * 0.90f else width * 0.835f
+        val standardRightX = if (isLandscape) width * 0.94f else width * 0.910f
+        val leftX = if (isLandscape) width * 0.07f else width * 0.085f
+        val topY = if (isLandscape) height * 0.08f else height * 0.065f
 
-        // 1. 優先點擊卡片右上角 (圖中的白色細叉叉)
-        clickAt(rightX, topY)
+        // 1. 優先戳金幣旁的位置
+        clickAt(playableRightX, topY)
 
-        // 2. 延遲 350ms 補點左上角 (針對 Google Play 浮動彈窗的左上叉叉)
-        Handler(Looper.getMainLooper()).postDelayed({
+        // 2. 補點常規右上角
+        mainHandler.postDelayed({
+            clickAt(standardRightX, topY)
+        }, 300L)
+
+        // 3. 補點左上角
+        mainHandler.postDelayed({
             clickAt(leftX, topY)
-        }, 350L)
+        }, 600L)
 
-        showToast("⚡ 已點擊廣告卡片關閉熱區")
+        showToast("⚡ 已點擊試玩關閉熱區")
     }
 
     private fun clickAt(x: Float, y: Float) {
@@ -259,7 +252,7 @@ class AutoClickService : AccessibilityService() {
     }
 
     private fun showToast(msg: String) {
-        Handler(Looper.getMainLooper()).post {
+        mainHandler.post {
             Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show()
         }
     }
