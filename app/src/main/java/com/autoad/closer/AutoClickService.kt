@@ -18,13 +18,21 @@ class AutoClickService : AccessibilityService() {
 
     companion object {
         var instance: AutoClickService? = null
-        private const val CHECK_INTERVAL_MS = 4000L // 每 4 秒定時偵測
+        private const val CHECK_INTERVAL_MS = 3500L // 固定每 3.5 秒執行一次巡檢與點擊
+
+        // 唯二保護的系統安全黑名單：只有在桌面、設定、狀態列時才不動作
+        private val SYSTEM_SAFE_PACKAGES = listOf(
+            "settings",
+            "launcher",
+            "systemui",
+            "inputmethod",
+            "closer"
+        )
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isServiceRunning = false
 
-    // 關閉與快進特徵清單
     private val CLOSE_PATTERNS = listOf(
         "✕", "×", "✖", "X", "x",
         "⏯", "▶|", "|▶", ">>", "»", ">", "⏩",
@@ -37,10 +45,11 @@ class AutoClickService : AccessibilityService() {
             if (!isServiceRunning) return
 
             try {
-                processCurrentScreen()
+                processScreenAction()
             } catch (e: Exception) {
                 e.printStackTrace()
             } finally {
+                // 確保閉環循環，絕不中斷
                 mainHandler.postDelayed(this, CHECK_INTERVAL_MS)
             }
         }
@@ -51,7 +60,7 @@ class AutoClickService : AccessibilityService() {
         instance = this
         isServiceRunning = true
 
-        showToast("AutoAdCloser 服務已連線！(支援左右隨機細叉)")
+        showToast("AutoAdCloser 已啟動 (已開啟非系統畫面全覆蓋模式)")
 
         mainHandler.removeCallbacks(inspectionRunnable)
         mainHandler.postDelayed(inspectionRunnable, 1000L)
@@ -65,12 +74,15 @@ class AutoClickService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // 系統事件照常監聽
+        // 系統產生畫面異動時連帶觸發
     }
 
     override fun onInterrupt() {}
 
-    private fun processCurrentScreen() {
+    /**
+     * 核心邏輯：只要不是系統安全畫面，一律執行關閉
+     */
+    private fun processScreenAction() {
         val roots = mutableListOf<AccessibilityNodeInfo>()
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
@@ -86,64 +98,53 @@ class AutoClickService : AccessibilityService() {
 
         if (roots.isEmpty()) return
 
-        // 自家與設定頁防護
+        // 唯一檢查：是否在手機桌面或系統設定頁？
         for (r in roots) {
-            if (isSafeScreen(r)) return
+            if (isSystemSafeScreen(r)) {
+                return // 在桌面或設定頁時完全靜音
+            }
         }
 
-        showToast("🔍 正在偵測廣告...")
+        // 只要不是系統操作畫面，每 3.5 秒固定跳出提示並執行關閉
+        showToast("🔍 正在嘗試關閉廣告...")
 
-        // 1. 優先文字/符號節點掃描
+        // 1. 優先嘗試點擊帶有符號/文字的精準按鈕
+        var clicked = false
         for (r in roots) {
             if (scanAndClickNodes(r)) {
-                return
+                clicked = true
+                break
             }
         }
 
-        // 2. 針對試玩或帶有廣告特徵畫面發動左右雙向四點補刀
-        for (r in roots) {
-            if (isPlayableOrAdScreen(r)) {
-                triggerPlayableCornerHotspots()
-                return
-            }
+        // 2. 無論有沒有文字按鈕，全面對左上、右上（含金幣內縮角）發動實體熱區補刀
+        if (!clicked) {
+            triggerAllCornerHotspots()
         }
     }
 
-    private fun isSafeScreen(node: AccessibilityNodeInfo): Boolean {
+    /**
+     * 判斷是否為手機桌面、系統設定或本 App 介面
+     */
+    private fun isSystemSafeScreen(node: AccessibilityNodeInfo): Boolean {
+        val pkg = node.packageName?.toString()?.lowercase() ?: ""
         val text = node.text?.toString() ?: ""
         val desc = node.contentDescription?.toString() ?: ""
-        val pkg = node.packageName?.toString()?.lowercase() ?: ""
 
         if (text.contains("AutoAdCloser", ignoreCase = true) || 
-            desc.contains("AutoAdCloser", ignoreCase = true) ||
-            pkg.contains("settings")) {
+            desc.contains("AutoAdCloser", ignoreCase = true)) {
             return true
         }
 
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            if (isSafeScreen(child)) return true
-        }
-        return false
-    }
-
-    private fun isPlayableOrAdScreen(node: AccessibilityNodeInfo): Boolean {
-        val keywords = listOf(
-            "拖拽", "移動", "開始遊戲", "开始游戏",
-            "play now", "learn more", "install", "download", "安裝", "免費", "免费", "搶購"
-        )
-        val text = node.text?.toString()?.lowercase() ?: ""
-        val desc = node.contentDescription?.toString()?.lowercase() ?: ""
-
-        for (kw in keywords) {
-            if (text.contains(kw) || desc.contains(kw)) {
+        for (safe in SYSTEM_SAFE_PACKAGES) {
+            if (pkg.contains(safe)) {
                 return true
             }
         }
 
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            if (isPlayableOrAdScreen(child)) return true
+            if (isSystemSafeScreen(child)) return true
         }
         return false
     }
@@ -173,7 +174,6 @@ class AutoClickService : AccessibilityService() {
             val child = node.getChild(i) ?: continue
             if (scanAndClickNodes(child)) return true
         }
-
         return false
     }
 
@@ -198,32 +198,29 @@ class AutoClickService : AccessibilityService() {
     }
 
     /**
-     * 支援直向/橫向，全面覆蓋左右兩側隨機出現的細叉（內縮金幣位 + 極限邊角位）
+     * 全面覆蓋雙邊角落：極限右上角、金幣內縮右上角、極限左上角、金幣內縮左上角
      */
-    private fun triggerPlayableCornerHotspots() {
+    private fun triggerAllCornerHotspots() {
         val (width, height) = getRealScreenSize()
         if (width <= 0 || height <= 0) return
 
         val isLandscape = width > height
 
-        // 1. 金幣旁內縮細叉（右側與左側對稱）
-        val innerRightX = if (isLandscape) width * 0.90f else width * 0.835f
-        val innerLeftX  = if (isLandscape) width * 0.10f else width * 0.165f
+        // 1. 極限邊緣座標（適用於你截圖中的圓形細叉與全螢幕廣告叉叉）
+        val extremeRightX = if (isLandscape) width * 0.945f else width * 0.938f
+        val extremeLeftX  = if (isLandscape) width * 0.055f else width * 0.062f
 
-        // 2. 常規邊緣極限角（右側與左側）
-        val outerRightX = if (isLandscape) width * 0.94f else width * 0.910f
-        val outerLeftX  = if (isLandscape) width * 0.06f else width * 0.085f
+        // 2. 內縮金幣旁座標（適用於試玩廣告金幣右側）
+        val innerRightX   = if (isLandscape) width * 0.900f else width * 0.835f
+        val innerLeftX    = if (isLandscape) width * 0.100f else width * 0.165f
 
-        val topY = if (isLandscape) height * 0.08f else height * 0.065f
+        val topY          = if (isLandscape) height * 0.080f else height * 0.068f
 
-        // 點擊順序：右內縮 -> 左內縮 -> 右極限 -> 左極限
-        clickAt(innerRightX, topY)
-
-        mainHandler.postDelayed({ clickAt(innerLeftX, topY) }, 200L)
-        mainHandler.postDelayed({ clickAt(outerRightX, topY) }, 400L)
-        mainHandler.postDelayed({ clickAt(outerLeftX, topY) }, 600L)
-
-        showToast("⚡ 已點擊雙向隨機關閉熱區")
+        // 梯次點擊：極限右上 -> 內縮右上 -> 極限左上 -> 內縮左上
+        clickAt(extremeRightX, topY)
+        mainHandler.postDelayed({ clickAt(innerRightX, topY) }, 200L)
+        mainHandler.postDelayed({ clickAt(extremeLeftX, topY) }, 400L)
+        mainHandler.postDelayed({ clickAt(innerLeftX, topY) }, 600L)
     }
 
     private fun clickAt(x: Float, y: Float) {
