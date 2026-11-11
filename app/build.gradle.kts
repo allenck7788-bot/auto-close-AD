@@ -16,10 +16,11 @@ android {
         minSdk = 24
         targetSdk = 34
 
-        // 讀取 GitHub Actions 自動遞增的執行編號，若本地編譯預設為 1
+        // 讀取 GitHub Actions 自動累加的執行編號
         val runNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
         versionCode = runNumber
-        versionName = "1.0.$runNumber"
+        // 修改為 v1.xxx 格式（例如 v1.12）
+        versionName = "1.$runNumber"
 
         // 動態生成台北時間（年-月-日 時:分）
         val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm").apply {
@@ -27,7 +28,6 @@ android {
         }
         val buildTime = dateFormat.format(Date())
 
-        // 注入到 BuildConfig 常數
         buildConfigField("String", "BUILD_TIME", "\"$buildTime\"")
     }
 
