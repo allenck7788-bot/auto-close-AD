@@ -13,26 +13,20 @@ import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Toast
+import kotlinx.coroutines.*
 
 class AutoClickService : AccessibilityService() {
 
     companion object {
         var instance: AutoClickService? = null
-        private const val COOLDOWN_MS = 4000L // 4 秒安全冷卻
-
-        // 系統與日常絕對安全清單
-        private val SAFE_PACKAGES = listOf(
-            "settings",
-            "launcher",
-            "systemui",
-            "inputmethod",
-            "closer"
-        )
+        private const val COOLDOWN_MS = 3000L // 3 秒冷卻
     }
 
+    private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
+    private var isServiceRunning = false
     private var lastActionTime = 0L
 
-    // 關閉與快進特徵清單
+    // 特徵清單（含快進、關閉、X 符號）
     private val CLOSE_PATTERNS = listOf(
         "✕", "×", "✖", "X", "x",
         "⏯", "▶|", "|▶", ">>", "»", ">", "⏩",
@@ -43,53 +37,87 @@ class AutoClickService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
-        showToast("AutoAdCloser 已啟動 (已開啟每 4 秒偵測狀態提示)")
+        isServiceRunning = true
+        showToast("AutoAdCloser 已啟動 (已開啟多視窗主動巡檢)")
+        
+        // 啟動主動輪詢循環（解決畫面靜止或分層彈窗不拋出事件的問題）
+        startActiveInspectionLoop()
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        isServiceRunning = false
+        serviceScope.cancel()
         instance = null
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null) return
-
-        val currentTime = System.currentTimeMillis()
-        if (currentTime - lastActionTime < COOLDOWN_MS) {
-            return
-        }
-
-        // 1. 安全防護：系統設定或日常介面不動作
-        val pkg = event.packageName?.toString()?.lowercase() ?: ""
-        for (safe in SAFE_PACKAGES) {
-            if (pkg.contains(safe)) {
-                return
-            }
-        }
-
-        try {
-            val root = rootInActiveWindow ?: event.source ?: return
-
-            // 2. 自家 App 介面熔斷保護
-            if (isSafeScreen(root)) {
-                return
-            }
-
-            // 3. 執行輪詢心跳提示（讓你知道程式正在運作中）
-            lastActionTime = currentTime
-            showToast("🔍 偵測廣告中...")
-
-            // 4. 優先嘗試比對文字/符號節點
-            val clicked = scanAndClickNodes(root)
-
-            // 5. 若為純貼圖/無文字按鈕，但畫面包含廣告特徵（如 Learn More、安裝等），發動雙角落手勢
-            if (!clicked && isAdScreenWithActionBtn(root)) {
-                triggerCornerAdHotspots()
-            }
-        } catch (_: Exception) {}
+        // 事件驅動觸發巡檢
+        inspectAndProcessScreen()
     }
 
     override fun onInterrupt() {}
+
+    /**
+     * 主動式每 3.5 秒定時巡檢，防止彈窗靜態卡死
+     */
+    private fun startActiveInspectionLoop() {
+        serviceScope.launch {
+            while (isServiceRunning) {
+                delay(3500L)
+                inspectAndProcessScreen()
+            }
+        }
+    }
+
+    /**
+     * 核心多視窗分析流程
+     */
+    private fun inspectAndProcessScreen() {
+        val currentTime = System.currentTimeMillis()
+        if (currentTime - lastActionTime < COOLDOWN_MS) return
+
+        // 1. 取得目前螢幕上所有可互動的視窗（突破彈窗/分層盲點）
+        val allRoots = mutableListOf<AccessibilityNodeInfo>()
+        
+        try {
+            // 嘗試取得所有層級視窗（包含 Google Play 覆蓋層）
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                windows?.forEach { win ->
+                    win.root?.let { allRoots.add(it) }
+                }
+            }
+        } catch (_: Exception) {}
+
+        // 若無多視窗權限，回退使用根視窗
+        if (allRoots.isEmpty()) {
+            rootInActiveWindow?.let { allRoots.add(it) }
+        }
+
+        if (allRoots.isEmpty()) return
+
+        // 2. 自身設定頁安全防護
+        for (root in allRoots) {
+            if (isSafeScreen(root)) return
+        }
+
+        // 3. 逐層掃描所有視窗的文字與符號節點
+        for (root in allRoots) {
+            if (scanAndClickNodes(root)) {
+                lastActionTime = System.currentTimeMillis()
+                return
+            }
+        }
+
+        // 4. 若無文字節點，但畫面存在廣告特徵（如 Unity Ads、Play Now、安裝等），發動彈窗雙熱區盲點
+        for (root in allRoots) {
+            if (isAdScreenWithActionBtn(root)) {
+                lastActionTime = System.currentTimeMillis()
+                triggerCardCornerHotspots()
+                return
+            }
+        }
+    }
 
     private fun isSafeScreen(node: AccessibilityNodeInfo): Boolean {
         val text = node.text?.toString() ?: ""
@@ -110,12 +138,12 @@ class AutoClickService : AccessibilityService() {
     }
 
     /**
-     * 檢查是否帶有廣告標籤特徵（加入 Learn More、搶購、PChome 等商業廣告特徵）
+     * 檢查是否帶有廣告標籤特徵（加入 Unity Ads, Play Now, 安裝等）
      */
     private fun isAdScreenWithActionBtn(node: AccessibilityNodeInfo): Boolean {
         val adKeywords = listOf(
-            "learn more", "install", "download", "play",
-            "安裝", "开始游戏", "開始遊戲", "立即購買", "立即下载", "搶購", "優惠"
+            "play now", "learn more", "install", "download", "unity ads",
+            "安裝", "开始游戏", "開始遊戲", "立即購買", "立即下载", "搶購", "優惠", "免費"
         )
         val text = node.text?.toString()?.lowercase() ?: ""
         val desc = node.contentDescription?.toString()?.lowercase() ?: ""
@@ -138,25 +166,24 @@ class AutoClickService : AccessibilityService() {
         val desc = node.contentDescription?.toString()?.trim() ?: ""
         val viewId = node.viewIdResourceName?.lowercase() ?: ""
 
-        // 1. 符號與關鍵字比對
+        // 比對精準符號與詞彙
         for (pattern in CLOSE_PATTERNS) {
             if (isMatchingPattern(text, pattern) || isMatchingPattern(desc, pattern)) {
                 if (performGestureClick(node)) {
-                    showToast("⚡ 已點擊：$pattern")
+                    showToast("⚡ 手勢點擊：$pattern")
                     return true
                 }
             }
         }
 
-        // 2. View ID 比對
+        // 比對常見 View ID
         if (viewId.contains("close") || viewId.contains("skip") || viewId.contains("dismiss")) {
             if (performGestureClick(node)) {
-                showToast("⚡ 已點擊廣告按鈕元件")
+                showToast("⚡ 手勢點擊：關閉元件")
                 return true
             }
         }
 
-        // 3. 遞迴子元件
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
             if (scanAndClickNodes(child)) return true
@@ -178,8 +205,7 @@ class AutoClickService : AccessibilityService() {
         val rect = Rect()
         node.getBoundsInScreen(rect)
 
-        // 針對按鈕區域做點擊
-        if (rect.width() in 10..380 && rect.height() in 10..380) {
+        if (rect.width() in 10..400 && rect.height() in 10..400) {
             clickAt(rect.centerX().toFloat(), rect.centerY().toFloat())
             return true
         }
@@ -187,28 +213,29 @@ class AutoClickService : AccessibilityService() {
     }
 
     /**
-     * 雙角落（右上 + 左上）熱區點擊（針對照片中圓形灰色叉叉位置精準補刀）
+     * 針對截圖中 Unity Ads 圓角卡片與 Google Play 彈窗量身微調的實體手勢座標
      */
-    private fun triggerCornerAdHotspots() {
+    private fun triggerCardCornerHotspots() {
         val (width, height) = getRealScreenSize()
         if (width <= 0 || height <= 0) return
 
         val isLandscape = width > height
 
-        // 根據直橫向微調，針對照片中的右上角叉叉比例（X 約 89.5%, Y 約 9.2%）
-        val rightX = if (isLandscape) width * 0.935f else width * 0.895f
-        val leftX = if (isLandscape) width * 0.065f else width * 0.095f
-        val topY = if (isLandscape) height * 0.085f else height * 0.092f
+        // 卡片右上角叉叉比例（直向約 89%, 橫向約 92%）
+        val rightX = if (isLandscape) width * 0.92f else width * 0.89f
+        // Google Play 安裝彈窗左上角叉叉比例
+        val leftX = if (isLandscape) width * 0.08f else width * 0.09f
+        val topY = if (isLandscape) height * 0.085f else height * 0.09f
 
-        // 1. 優先點擊右上角
+        // 1. 優先點擊卡片右上角 (圖中的白色細叉叉)
         clickAt(rightX, topY)
 
-        // 2. 延遲 300ms 點擊左上角，兼顧左右隨機按鈕
+        // 2. 延遲 350ms 補點左上角 (針對 Google Play 浮動彈窗的左上叉叉)
         Handler(Looper.getMainLooper()).postDelayed({
             clickAt(leftX, topY)
-        }, 300L)
+        }, 350L)
 
-        showToast("⚡ 已執行角落按鈕點擊")
+        showToast("⚡ 已點擊廣告卡片關閉熱區")
     }
 
     private fun clickAt(x: Float, y: Float) {
