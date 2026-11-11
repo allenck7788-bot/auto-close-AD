@@ -9,6 +9,8 @@ import android.provider.Settings
 import android.view.Gravity
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.RelativeLayout
 import android.widget.Switch
 import android.widget.TextView
@@ -18,17 +20,20 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var tvStatus: TextView
     private lateinit var switchDebugMode: Switch
+    private lateinit var rgDelay: RadioGroup
+    private lateinit var rb8s: RadioButton
+    private lateinit var rb15s: RadioButton
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 最外層 RelativeLayout，方便將版本時間固定在右下角
+        val sp = getSharedPreferences("autoad_prefs", Context.MODE_PRIVATE)
+
         val rootLayout = RelativeLayout(this).apply {
             setBackgroundColor(Color.parseColor("#FAFAFA"))
             setPadding(48, 48, 48, 48)
         }
 
-        // 中央垂直排列的主內容區
         val centerLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -41,7 +46,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = centerParams
         }
 
-        // 1. 服務狀態文字
+        // 1. 服務狀態
         tvStatus = TextView(this).apply {
             textSize = 20f
             typeface = Typeface.DEFAULT_BOLD
@@ -52,7 +57,7 @@ class MainActivity : AppCompatActivity() {
         }
         centerLayout.addView(tvStatus)
 
-        // 2. 前往無障礙設定按鈕
+        // 2. 前往設定按鈕
         val btnOpenAccessibility = Button(this).apply {
             text = "前往無障礙設定頁面"
             textSize = 16f
@@ -60,7 +65,7 @@ class MainActivity : AppCompatActivity() {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 150
             ).apply {
-                topMargin = 64
+                topMargin = 48
             }
             setOnClickListener {
                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
@@ -68,17 +73,79 @@ class MainActivity : AppCompatActivity() {
         }
         centerLayout.addView(btnOpenAccessibility)
 
-        // 3. 除錯模式開關列（取代原有的測試按鈕）
-        val debugBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+        // 3. 等待秒數選擇設定 (預設 8 秒，可選 15 秒)
+        val delaySettingLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#EEEEEE"))
-            setPadding(32, 24, 32, 24)
+            setPadding(32, 20, 32, 20)
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                topMargin = 48
+                topMargin = 32
+            }
+        }
+
+        val tvDelayLabel = TextView(this).apply {
+            text = "關閉前等待秒數："
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.parseColor("#333333"))
+        }
+        delaySettingLayout.addView(tvDelayLabel)
+
+        rgDelay = RadioGroup(this).apply {
+            orientation = RadioGroup.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = 12
+            }
+        }
+
+        val currentDelay = sp.getInt("click_delay_sec", 8)
+
+        rb8s = RadioButton(this).apply {
+            text = "等待 8 秒 (預設)"
+            textSize = 14f
+            id = 8
+            isChecked = (currentDelay == 8)
+        }
+
+        rb15s = RadioButton(this).apply {
+            text = "等待 15 秒"
+            textSize = 14f
+            id = 15
+            isChecked = (currentDelay == 15)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                marginStart = 36
+            }
+        }
+
+        rgDelay.addView(rb8s)
+        rgDelay.addView(rb15s)
+        rgDelay.setOnCheckedChangeListener { _, checkedId ->
+            val sec = if (checkedId == 15) 15 else 8
+            sp.edit().putInt("click_delay_sec", sec).apply()
+        }
+        delaySettingLayout.addView(rgDelay)
+        centerLayout.addView(delaySettingLayout)
+
+        // 4. 除錯模式開關
+        val debugBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(Color.parseColor("#EEEEEE"))
+            setPadding(32, 20, 32, 20)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = 24
             }
         }
 
@@ -89,7 +156,6 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
 
-        val sp = getSharedPreferences("autoad_prefs", Context.MODE_PRIVATE)
         switchDebugMode = Switch(this).apply {
             isChecked = sp.getBoolean("debug_mode", false)
             setOnCheckedChangeListener { _, isChecked ->
@@ -101,9 +167,9 @@ class MainActivity : AppCompatActivity() {
         debugBar.addView(switchDebugMode)
         centerLayout.addView(debugBar)
 
-        // 4. 說明文字
+        // 5. 說明文字
         val tvDesc = TextView(this).apply {
-            text = "說明：\n開啟除錯模式後，若精準識別到關閉按鈕，會在該按鈕正下方顯示「關閉！」字樣，方便截圖排查。"
+            text = "說明：\n偵測到關閉按鈕時，將依所選秒數倒數等待，並在按鈕正下方顯示警示，防太早點擊跳轉。"
             textSize = 13f
             gravity = Gravity.CENTER
             setTextColor(Color.parseColor("#888888"))
@@ -112,19 +178,18 @@ class MainActivity : AppCompatActivity() {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                topMargin = 48
+                topMargin = 32
             }
         }
         centerLayout.addView(tvDesc)
 
-        // 將中央區加入最外層
         rootLayout.addView(centerLayout)
 
-        // 5. 右下角：動態程式修改時間與自動遞增版本號
+        // 6. 右下角：版本與編譯時間
         val buildInfoText = try {
             "v${BuildConfig.VERSION_NAME} (${BuildConfig.BUILD_TIME})"
         } catch (_: Exception) {
-            "v1.0.0"
+            "v1.0"
         }
 
         val tvBuildInfo = TextView(this).apply {
