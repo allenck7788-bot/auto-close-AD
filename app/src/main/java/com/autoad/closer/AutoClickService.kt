@@ -9,6 +9,8 @@ import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.DisplayMetrics
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Toast
@@ -33,7 +35,7 @@ class AutoClickService : AccessibilityService() {
     private var isServiceRunning = false
     private var audioManager: AudioManager? = null
 
-    // 關閉與快進特徵清單
+    // 常規廣告關閉與快進特徵清單
     private val CLOSE_PATTERNS = listOf(
         "✕", "×", "✖", "X", "x",
         "⏯", "▶|", "|▶", ">>", "»", ">", "⏩",
@@ -129,13 +131,100 @@ class AutoClickService : AccessibilityService() {
             if (isSafeScreen(r)) return
         }
 
-        // 唯一動作：精準比對。只有抓到符合的按鈕節點才會點擊！
-        // 找不到按鈕就什麼都不做，絕不盲點！
+        // =========================================================
+        // 【獨立專屬永久功能】：若出現「完整快取中」則自動點擊左上角 ←
+        // =========================================================
+        for (r in roots) {
+            if (checkAndHandleCachingScreen(r)) {
+                return // 已成功處理快取畫面，直接結束本輪動作
+            }
+        }
+
+        // =========================================================
+        // 【一般廣告精準比對】：只有抓到關閉按鈕才會點擊
+        // =========================================================
         for (r in roots) {
             if (scanAndClickNodes(r)) {
                 break
             }
         }
+    }
+
+    /**
+     * 【固定功能】檢查是否處於「完整快取中」畫面，並點擊左上角返回
+     */
+    private fun checkAndHandleCachingScreen(root: AccessibilityNodeInfo): Boolean {
+        if (!hasTextKeyword(root, "完整快取中")) {
+            return false
+        }
+
+        showAlwaysToast("⚡ 偵測到「完整快取中」，點擊左上返回")
+
+        // 1. 優先嘗試尋找左上角具體的返回鍵元件 (←, Back, Navigate up)
+        if (findAndClickBackButton(root)) {
+            return true
+        }
+
+        // 2. 若箭頭按鈕為純圖片無文字/ID，則點擊左上角返回實體按鈕精準座標
+        clickTopLeftBackButton()
+        return true
+    }
+
+    private fun hasTextKeyword(node: AccessibilityNodeInfo, keyword: String): Boolean {
+        val text = node.text?.toString() ?: ""
+        val desc = node.contentDescription?.toString() ?: ""
+        if (text.contains(keyword) || desc.contains(keyword)) {
+            return true
+        }
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            if (hasTextKeyword(child, keyword)) return true
+        }
+        return false
+    }
+
+    private fun findAndClickBackButton(node: AccessibilityNodeInfo): Boolean {
+        val text = node.text?.toString()?.trim() ?: ""
+        val desc = node.contentDescription?.toString()?.trim() ?: ""
+        val viewId = node.viewIdResourceName?.lowercase() ?: ""
+
+        val isBackKey = text == "←" || desc == "←" ||
+                desc.contains("返回", ignoreCase = true) ||
+                desc.contains("navigate up", ignoreCase = true) ||
+                desc.contains("back", ignoreCase = true) ||
+                viewId.contains("back") || viewId.contains("up")
+
+        if (isBackKey) {
+            val rect = Rect()
+            node.getBoundsInScreen(rect)
+            // 確保該元件位於螢幕左上半部（避免誤點底部的返回或不相關元件）
+            if (rect.centerX() < 300 && rect.centerY() < 400) {
+                if (performGestureClick(node)) return true
+            }
+        }
+
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            if (findAndClickBackButton(child)) return true
+        }
+        return false
+    }
+
+    /**
+     * 點擊頂部導航列左上角 ← 實體熱區 (比例約 X: 7.5%, Y: 4.8%)
+     */
+    private fun clickTopLeftBackButton() {
+        val (width, height) = getRealScreenSize()
+        if (width <= 0 || height <= 0) return
+
+        val isLandscape = width > height
+        val backX = if (isLandscape) width * 0.05f else width * 0.075f
+        val backY = if (isLandscape) height * 0.06f else height * 0.048f
+
+        val path = Path().apply { moveTo(backX, backY) }
+        val stroke = GestureDescription.StrokeDescription(path, 0, 50)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        dispatchGesture(gesture, null, null)
     }
 
     private fun isSafeScreen(node: AccessibilityNodeInfo): Boolean {
@@ -156,15 +245,11 @@ class AutoClickService : AccessibilityService() {
         return false
     }
 
-    /**
-     * 嚴格掃描：只有節點文字、標籤或 ID 含有關閉/跳過特徵時才觸發
-     */
     private fun scanAndClickNodes(node: AccessibilityNodeInfo): Boolean {
         val text = node.text?.toString()?.trim() ?: ""
         val desc = node.contentDescription?.toString()?.trim() ?: ""
         val viewId = node.viewIdResourceName?.lowercase() ?: ""
 
-        // 1. 文字或無障礙標籤符合關閉/快進符號
         for (pattern in CLOSE_PATTERNS) {
             if (isMatchingPattern(text, pattern) || isMatchingPattern(desc, pattern)) {
                 if (performGestureClick(node)) {
@@ -174,7 +259,6 @@ class AutoClickService : AccessibilityService() {
             }
         }
 
-        // 2. 元件 ID 包含 close / skip / dismiss
         if (viewId.contains("close") || viewId.contains("skip") || viewId.contains("dismiss")) {
             if (performGestureClick(node)) {
                 showAlwaysToast("⚡ 點擊關閉元件")
@@ -182,7 +266,6 @@ class AutoClickService : AccessibilityService() {
             }
         }
 
-        // 3. 遞迴子節點
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
             if (scanAndClickNodes(child)) return true
@@ -199,10 +282,6 @@ class AutoClickService : AccessibilityService() {
         }
     }
 
-    /**
-     * 取得該按鈕的實體座標模擬點擊中心
-     * 限制寬高在 10px ~ 450px 之間，避免按到全螢幕大背景
-     */
     private fun performGestureClick(node: AccessibilityNodeInfo): Boolean {
         val rect = Rect()
         node.getBoundsInScreen(rect)
@@ -217,11 +296,10 @@ class AutoClickService : AccessibilityService() {
         return false
     }
 
-    private fun showAlwaysToast(msg: String) {
-        mainHandler.post {
-            try {
-                Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show()
-            } catch (_: Exception) {}
-        }
-    }
-}
+    private fun getRealScreenSize(): Pair<Int, Int> {
+        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = wm.currentWindowMetrics.bounds
+            Pair(bounds.width(), bounds.height())
+        } else {
+            val dm
