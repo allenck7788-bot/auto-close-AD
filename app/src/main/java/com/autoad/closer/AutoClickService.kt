@@ -19,22 +19,12 @@ class AutoClickService : AccessibilityService() {
 
     companion object {
         var instance: AutoClickService? = null
-        private const val CHECK_INTERVAL_MS = 4000L // 每 4 秒定時巡檢
-
-        // 系統安全黑名單：桌面、設定、鍵盤不執行點擊
-        private val SYSTEM_SAFE_PACKAGES = listOf(
-            "settings",
-            "launcher",
-            "systemui",
-            "inputmethod",
-            "closer"
-        )
+        private const val CHECK_INTERVAL_MS = 4000L // 嚴格固定每 4 秒執行一次
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isServiceRunning = false
     private var audioManager: AudioManager? = null
-    private var currentToast: Toast? = null
 
     private val CLOSE_PATTERNS = listOf(
         "✕", "×", "✖", "X", "x",
@@ -47,11 +37,11 @@ class AutoClickService : AccessibilityService() {
         override fun run() {
             if (!isServiceRunning) return
 
-            try {
-                // 1. 每 4 秒保證先彈出偵測提示
-                showToast("🔍 正在偵測廣告中...")
+            // 1. 無論任何狀態、任何畫面，第一順位絕對先跳提示證明定時器在線！
+            showAlwaysToast("🔍 正在偵測廣告中...")
 
-                // 2. 音量微震盪保活喚醒系統事件
+            try {
+                // 2. 音量極速震盪喚醒底層視窗管線
                 triggerVolumeWakeup()
 
                 // 3. 執行關閉流程
@@ -59,7 +49,7 @@ class AutoClickService : AccessibilityService() {
             } catch (e: Exception) {
                 e.printStackTrace()
             } finally {
-                // 閉環排程：確保 4 秒後必定再次執行
+                // 保證 4 秒後閉環排程
                 mainHandler.postDelayed(this, CHECK_INTERVAL_MS)
             }
         }
@@ -71,7 +61,7 @@ class AutoClickService : AccessibilityService() {
         isServiceRunning = true
         audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
 
-        showToast("AutoAdCloser 服務已連線！")
+        showAlwaysToast("AutoAdCloser 服務已連線！(每 4 秒定時巡檢)")
 
         mainHandler.removeCallbacks(inspectionRunnable)
         mainHandler.postDelayed(inspectionRunnable, 1000L)
@@ -85,7 +75,7 @@ class AutoClickService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // 系統事件照常監聽
+        // 系統產生畫面異動時連帶觸發
     }
 
     override fun onInterrupt() {}
@@ -101,12 +91,12 @@ class AutoClickService : AccessibilityService() {
                 am.setStreamVolume(streamType, currentVol - 1, AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE)
                 mainHandler.postDelayed({
                     am.setStreamVolume(streamType, currentVol, AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE)
-                }, 50L)
+                }, 40L)
             } else if (currentVol < maxVol) {
                 am.setStreamVolume(streamType, currentVol + 1, AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE)
                 mainHandler.postDelayed({
                     am.setStreamVolume(streamType, currentVol, AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE)
-                }, 50L)
+                }, 40L)
             }
         } catch (_: Exception) {}
     }
@@ -125,16 +115,9 @@ class AutoClickService : AccessibilityService() {
             rootInActiveWindow?.let { roots.add(it) }
         }
 
-        if (roots.isEmpty()) {
-            triggerAllCornerHotspots()
-            return
-        }
-
-        // 桌面與設定安全檢查
+        // 避免在手機設定頁面關閉自身服務
         for (r in roots) {
-            if (isSystemSafeScreen(r)) {
-                return
-            }
+            if (isSafeScreen(r)) return
         }
 
         // 1. 優先掃描節點文字與元件 ID
@@ -146,31 +129,26 @@ class AutoClickService : AccessibilityService() {
             }
         }
 
-        // 2. 無文字按鈕時執行多點熱區手勢補刀
+        // 2. 若為純貼圖/無文字按鈕，直接無條件發動各類角落熱區點擊（含 Unity Ads 卡片叉叉）
         if (!clicked) {
             triggerAllCornerHotspots()
         }
     }
 
-    private fun isSystemSafeScreen(node: AccessibilityNodeInfo): Boolean {
-        val pkg = node.packageName?.toString()?.lowercase() ?: ""
+    private fun isSafeScreen(node: AccessibilityNodeInfo): Boolean {
         val text = node.text?.toString() ?: ""
         val desc = node.contentDescription?.toString() ?: ""
+        val pkg = node.packageName?.toString()?.lowercase() ?: ""
 
         if (text.contains("AutoAdCloser", ignoreCase = true) || 
-            desc.contains("AutoAdCloser", ignoreCase = true)) {
+            desc.contains("AutoAdCloser", ignoreCase = true) ||
+            pkg.contains("settings")) {
             return true
-        }
-
-        for (safe in SYSTEM_SAFE_PACKAGES) {
-            if (pkg.contains(safe)) {
-                return true
-            }
         }
 
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            if (isSystemSafeScreen(child)) return true
+            if (isSafeScreen(child)) return true
         }
         return false
     }
@@ -183,7 +161,7 @@ class AutoClickService : AccessibilityService() {
         for (pattern in CLOSE_PATTERNS) {
             if (isMatchingPattern(text, pattern) || isMatchingPattern(desc, pattern)) {
                 if (performGestureClick(node)) {
-                    showToast("⚡ 手勢點擊：$pattern")
+                    showAlwaysToast("⚡ 手勢點擊：$pattern")
                     return true
                 }
             }
@@ -191,7 +169,7 @@ class AutoClickService : AccessibilityService() {
 
         if (viewId.contains("close") || viewId.contains("skip") || viewId.contains("dismiss")) {
             if (performGestureClick(node)) {
-                showToast("⚡ 手勢點擊：關閉元件")
+                showAlwaysToast("⚡ 手勢點擊：關閉元件")
                 return true
             }
         }
@@ -223,22 +201,34 @@ class AutoClickService : AccessibilityService() {
         return false
     }
 
+    /**
+     * 支援直向與橫向：梯次打擊四種最核心的關閉熱區
+     */
     private fun triggerAllCornerHotspots() {
         val (width, height) = getRealScreenSize()
         if (width <= 0 || height <= 0) return
 
         val isLandscape = width > height
 
-        val extremeRightX = if (isLandscape) width * 0.945f else width * 0.938f
-        val extremeLeftX  = if (isLandscape) width * 0.055f else width * 0.062f
-        val innerRightX   = if (isLandscape) width * 0.900f else width * 0.835f
-        val innerLeftX    = if (isLandscape) width * 0.100f else width * 0.165f
-        val topY          = if (isLandscape) height * 0.080f else height * 0.068f
+        // 1. 截圖中的 Unity Ads 圓角卡片右上角叉叉 (X: 約 89.2%, Y: 約 9.0%)
+        val unityCardRightX = if (isLandscape) width * 0.920f else width * 0.892f
+        val unityCardTopY   = if (isLandscape) height * 0.085f else height * 0.090f
 
-        clickAt(extremeRightX, topY)
-        mainHandler.postDelayed({ clickAt(innerRightX, topY) }, 200L)
-        mainHandler.postDelayed({ clickAt(extremeLeftX, topY) }, 400L)
-        mainHandler.postDelayed({ clickAt(innerLeftX, topY) }, 600L)
+        // 2. 全螢幕極限右上角叉叉
+        val extremeRightX   = if (isLandscape) width * 0.945f else width * 0.938f
+        val extremeTopY     = if (isLandscape) height * 0.080f else height * 0.068f
+
+        // 3. 試玩廣告金幣旁內縮右上角
+        val innerRightX     = if (isLandscape) width * 0.900f else width * 0.835f
+
+        // 4. 左上角常規熱區
+        val extremeLeftX    = if (isLandscape) width * 0.055f else width * 0.085f
+
+        // 依序連續發動點擊補刀：Unity 卡片叉 -> 極限右上 -> 內縮右上 -> 左上
+        clickAt(unityCardRightX, unityCardTopY)
+        mainHandler.postDelayed({ clickAt(extremeRightX, extremeTopY) }, 150L)
+        mainHandler.postDelayed({ clickAt(innerRightX, extremeTopY) }, 300L)
+        mainHandler.postDelayed({ clickAt(extremeLeftX, unityCardTopY) }, 450L)
     }
 
     private fun clickAt(x: Float, y: Float) {
@@ -261,12 +251,13 @@ class AutoClickService : AccessibilityService() {
         }
     }
 
-    private fun showToast(msg: String) {
+    /**
+     * 強制每次建立新 Toast 實體，徹底繞過 Android 11+ 系統頻率防抖限制
+     */
+    private fun showAlwaysToast(msg: String) {
         mainHandler.post {
             try {
-                currentToast?.cancel()
-                currentToast = Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT)
-                currentToast?.show()
+                Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show()
             } catch (_: Exception) {}
         }
     }
