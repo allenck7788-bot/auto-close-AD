@@ -5,6 +5,7 @@ import android.accessibilityservice.GestureDescription
 import android.content.Context
 import android.graphics.Path
 import android.graphics.Rect
+import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -18,9 +19,8 @@ class AutoClickService : AccessibilityService() {
 
     companion object {
         var instance: AutoClickService? = null
-        private const val CHECK_INTERVAL_MS = 3500L // 固定每 3.5 秒執行一次巡檢與點擊
+        private const val CHECK_INTERVAL_MS = 4000L // 嚴格每 4 秒定時跳出並執行
 
-        // 唯二保護的系統安全黑名單：只有在桌面、設定、狀態列時才不動作
         private val SYSTEM_SAFE_PACKAGES = listOf(
             "settings",
             "launcher",
@@ -32,6 +32,8 @@ class AutoClickService : AccessibilityService() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isServiceRunning = false
+    private var audioManager: AudioManager? = null
+    private var currentToast: Toast? = null
 
     private val CLOSE_PATTERNS = listOf(
         "✕", "×", "✖", "X", "x",
@@ -45,11 +47,18 @@ class AutoClickService : AccessibilityService() {
             if (!isServiceRunning) return
 
             try {
+                // 1. 保證第一順位：無條件強制彈出偵測提示！
+                showToast("🔍 正在偵測廣告中...")
+
+                // 2. 音量微震盪喚醒系統視窗管線
+                triggerVolumeWakeup()
+
+                // 3. 執行關閉動作
                 processScreenAction()
             } catch (e: Exception) {
                 e.printStackTrace()
             } finally {
-                // 確保閉環循環，絕不中斷
+                // 閉環排程：確保 4 秒後必定再次執行
                 mainHandler.postDelayed(this, CHECK_INTERVAL_MS)
             }
         }
@@ -59,8 +68,9 @@ class AutoClickService : AccessibilityService() {
         super.onServiceConnected()
         instance = this
         isServiceRunning = true
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
 
-        showToast("AutoAdCloser 已啟動 (已開啟非系統畫面全覆蓋模式)")
+        showToast("AutoAdCloser 服務已連線！")
 
         mainHandler.removeCallbacks(inspectionRunnable)
         mainHandler.postDelayed(inspectionRunnable, 1000L)
@@ -74,14 +84,32 @@ class AutoClickService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // 系統產生畫面異動時連帶觸發
+        // 系統事件照常監聽
     }
 
     override fun onInterrupt() {}
 
-    /**
-     * 核心邏輯：只要不是系統安全畫面，一律執行關閉
-     */
+    private fun triggerVolumeWakeup() {
+        val am = audioManager ?: return
+        try {
+            val streamType = AudioManager.STREAM_MUSIC
+            val currentVol = am.getStreamVolume(streamType)
+            val maxVol = am.getStreamMaxVolume(streamType)
+
+            if (currentVol > 0) {
+                am.setStreamVolume(streamType, currentVol - 1, AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE)
+                mainHandler.postDelayed({
+                    am.setStreamVolume(streamType, currentVol, AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE)
+                }, 50L)
+            } else if (currentVol < maxVol) {
+                am.setStreamVolume(streamType, currentVol + 1, AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE)
+                mainHandler.postDelayed({
+                    am.setStreamVolume(streamType, currentVol, AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE)
+                }, 50L)
+            }
+        } catch (_: Exception) {}
+    }
+
     private fun processScreenAction() {
         val roots = mutableListOf<AccessibilityNodeInfo>()
         try {
@@ -96,19 +124,20 @@ class AutoClickService : AccessibilityService() {
             rootInActiveWindow?.let { roots.add(it) }
         }
 
-        if (roots.isEmpty()) return
+        if (roots.isEmpty()) {
+            // 就算節點樹被廣告商遮蔽拿不到，也無條件盲點角落熱區
+            triggerAllCornerHotspots()
+            return
+        }
 
-        // 唯一檢查：是否在手機桌面或系統設定頁？
+        // 桌面與設定安全檢查
         for (r in roots) {
             if (isSystemSafeScreen(r)) {
-                return // 在桌面或設定頁時完全靜音
+                return
             }
         }
 
-        // 只要不是系統操作畫面，每 3.5 秒固定跳出提示並執行關閉
-        showToast("🔍 正在嘗試關閉廣告...")
-
-        // 1. 優先嘗試點擊帶有符號/文字的精準按鈕
+        // 1. 優先掃描節點
         var clicked = false
         for (r in roots) {
             if (scanAndClickNodes(r)) {
@@ -117,15 +146,12 @@ class AutoClickService : AccessibilityService() {
             }
         }
 
-        // 2. 無論有沒有文字按鈕，全面對左上、右上（含金幣內縮角）發動實體熱區補刀
+        // 2. 無文字按鈕時執行多點熱區補刀
         if (!clicked) {
             triggerAllCornerHotspots()
         }
     }
 
-    /**
-     * 判斷是否為手機桌面、系統設定或本 App 介面
-     */
     private fun isSystemSafeScreen(node: AccessibilityNodeInfo): Boolean {
         val pkg = node.packageName?.toString()?.lowercase() ?: ""
         val text = node.text?.toString() ?: ""
@@ -191,61 +217,4 @@ class AutoClickService : AccessibilityService() {
         node.getBoundsInScreen(rect)
 
         if (rect.width() in 10..450 && rect.height() in 10..450) {
-            clickAt(rect.centerX().toFloat(), rect.centerY().toFloat())
-            return true
-        }
-        return false
-    }
-
-    /**
-     * 全面覆蓋雙邊角落：極限右上角、金幣內縮右上角、極限左上角、金幣內縮左上角
-     */
-    private fun triggerAllCornerHotspots() {
-        val (width, height) = getRealScreenSize()
-        if (width <= 0 || height <= 0) return
-
-        val isLandscape = width > height
-
-        // 1. 極限邊緣座標（適用於你截圖中的圓形細叉與全螢幕廣告叉叉）
-        val extremeRightX = if (isLandscape) width * 0.945f else width * 0.938f
-        val extremeLeftX  = if (isLandscape) width * 0.055f else width * 0.062f
-
-        // 2. 內縮金幣旁座標（適用於試玩廣告金幣右側）
-        val innerRightX   = if (isLandscape) width * 0.900f else width * 0.835f
-        val innerLeftX    = if (isLandscape) width * 0.100f else width * 0.165f
-
-        val topY          = if (isLandscape) height * 0.080f else height * 0.068f
-
-        // 梯次點擊：極限右上 -> 內縮右上 -> 極限左上 -> 內縮左上
-        clickAt(extremeRightX, topY)
-        mainHandler.postDelayed({ clickAt(innerRightX, topY) }, 200L)
-        mainHandler.postDelayed({ clickAt(extremeLeftX, topY) }, 400L)
-        mainHandler.postDelayed({ clickAt(innerLeftX, topY) }, 600L)
-    }
-
-    private fun clickAt(x: Float, y: Float) {
-        val path = Path().apply { moveTo(x, y) }
-        val stroke = GestureDescription.StrokeDescription(path, 0, 50)
-        val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        dispatchGesture(gesture, null, null)
-    }
-
-    private fun getRealScreenSize(): Pair<Int, Int> {
-        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val bounds = wm.currentWindowMetrics.bounds
-            Pair(bounds.width(), bounds.height())
-        } else {
-            val dm = DisplayMetrics()
-            @Suppress("DEPRECATION")
-            wm.defaultDisplay.getRealMetrics(dm)
-            Pair(dm.widthPixels, dm.heightPixels)
-        }
-    }
-
-    private fun showToast(msg: String) {
-        mainHandler.post {
-            Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show()
-        }
-    }
-}
+            clickAt(rect.centerX().toFloat(),
