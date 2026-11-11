@@ -12,6 +12,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.DisplayMetrics
 import android.view.Gravity
+import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -24,20 +25,24 @@ class AutoClickService : AccessibilityService() {
         var instance: AutoClickService? = null
         private const val CHECK_INTERVAL_MS = 4000L // 每 4 秒巡檢一次
 
+        // 系統安全清單：設定、相簿、桌面不執行點擊
         private val SYSTEM_SAFE_PACKAGES = listOf(
             "settings",
             "launcher",
             "systemui",
             "inputmethod",
-            "closer"
+            "closer",
+            "gallery",
+            "photos"
         )
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isServiceRunning = false
+    private var isActionPending = false // 防重入標記
     private var windowManager: WindowManager? = null
 
-    // 常規廣告關閉特徵清單（排除易誤觸的快進符號）
+    // 常規廣告關閉特徵清單
     private val CLOSE_PATTERNS = listOf(
         "✕", "×", "✖", "X", "x",
         "⏯", "▶|", "|▶",
@@ -52,7 +57,9 @@ class AutoClickService : AccessibilityService() {
             showAlwaysToast("🔍 正在偵測廣告中...")
 
             try {
-                processScreenAction()
+                if (!isActionPending) {
+                    processScreenAction()
+                }
             } catch (e: Exception) {
                 e.printStackTrace()
             } finally {
@@ -197,8 +204,7 @@ class AutoClickService : AccessibilityService() {
         val pkg = node.packageName?.toString()?.lowercase() ?: ""
 
         if (text.contains("AutoAdCloser", ignoreCase = true) || 
-            desc.contains("AutoAdCloser", ignoreCase = true) ||
-            pkg.contains("settings")) {
+            desc.contains("AutoAdCloser", ignoreCase = true)) {
             return true
         }
 
@@ -237,134 +243,3 @@ class AutoClickService : AccessibilityService() {
         for (pattern in CLOSE_PATTERNS) {
             if (isMatchingPattern(text, pattern) || isMatchingPattern(desc, pattern)) {
                 if (performGestureClick(node)) {
-                    showAlwaysToast("⚡ 點擊關閉按鈕：$pattern")
-                    return true
-                }
-            }
-        }
-
-        // 2. 元件 ID 比對
-        if (viewId.contains("close") || viewId.contains("skip") || viewId.contains("dismiss")) {
-            if (performGestureClick(node)) {
-                showAlwaysToast("⚡ 點擊關閉元件")
-                return true
-            }
-        }
-
-        // 3. 純圖片 Unity Ads 卡片角落叉叉精準辨識 (高解析度寬高 20px..280px，位於頂部兩側角落無長篇文字的元件)
-        if (screenWidth > 0 && screenHeight > 0) {
-            val isSmallButton = rect.width() in 20..280 && rect.height() in 20..280
-            val isEdgeCorner = rect.top < screenHeight * 0.18f &&
-                    (rect.right > screenWidth * 0.82f || rect.left < screenWidth * 0.18f)
-            val hasNoLongText = text.length < 5 && desc.length < 5
-
-            if (isSmallButton && isEdgeCorner && hasNoLongText) {
-                if (performGestureClick(node)) {
-                    showAlwaysToast("⚡ 精準點擊角落關閉元件")
-                    return true
-                }
-            }
-        }
-
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            if (scanAndClickNodes(child)) return true
-        }
-        return false
-    }
-
-    private fun isMatchingPattern(source: String, pattern: String): Boolean {
-        if (source.isEmpty()) return false
-        return if (pattern.length == 1) {
-            source.contains(pattern)
-        } else {
-            source.equals(pattern, ignoreCase = true) || source.contains(pattern, ignoreCase = true)
-        }
-    }
-
-    private fun performGestureClick(node: AccessibilityNodeInfo): Boolean {
-        val rect = Rect()
-        node.getBoundsInScreen(rect)
-
-        if (rect.width() in 10..450 && rect.height() in 10..450) {
-            if (isDebugModeEnabled()) {
-                showDebugMarkerUnderButton(rect)
-            }
-
-            val path = Path().apply { moveTo(rect.centerX().toFloat(), rect.centerY().toFloat()) }
-            val stroke = GestureDescription.StrokeDescription(path, 0L, 50L)
-            val gesture = GestureDescription.Builder().addStroke(stroke).build()
-            dispatchGesture(gesture, null, null)
-            return true
-        }
-        return false
-    }
-
-    private fun isDebugModeEnabled(): Boolean {
-        val sp = getSharedPreferences("autoad_prefs", Context.MODE_PRIVATE)
-        return sp.getBoolean("debug_mode", false)
-    }
-
-    private fun showDebugMarkerUnderButton(buttonRect: Rect) {
-        mainHandler.post {
-            val wm = windowManager ?: return@post
-            try {
-                val markView = TextView(applicationContext).apply {
-                    text = "▼ 關閉！"
-                    setTextColor(Color.WHITE)
-                    textSize = 14f
-                    setBackgroundColor(Color.parseColor("#E53935"))
-                    setPadding(14, 6, 14, 6)
-                }
-
-                val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
-                } else {
-                    @Suppress("DEPRECATION")
-                    WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
-                }
-
-                val params = WindowManager.LayoutParams(
-                    WindowManager.LayoutParams.WRAP_CONTENT,
-                    WindowManager.LayoutParams.WRAP_CONTENT,
-                    layoutType,
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
-                    PixelFormat.TRANSLUCENT
-                ).apply {
-                    gravity = Gravity.TOP or Gravity.START
-                    x = (buttonRect.centerX() - 70).coerceAtLeast(10)
-                    y = buttonRect.bottom + 8
-                }
-
-                wm.addView(markView, params)
-
-                mainHandler.postDelayed({
-                    try {
-                        wm.removeView(markView)
-                    } catch (_: Exception) {}
-                }, 1500L)
-            } catch (_: Exception) {}
-        }
-    }
-
-    private fun getRealScreenSize(): Pair<Int, Int> {
-        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val bounds = wm.currentWindowMetrics.bounds
-            Pair(bounds.width(), bounds.height())
-        } else {
-            val dm = DisplayMetrics()
-            @Suppress("DEPRECATION")
-            wm.defaultDisplay.getRealMetrics(dm)
-            Pair(dm.widthPixels, dm.heightPixels)
-        }
-    }
-
-    private fun showAlwaysToast(msg: String) {
-        mainHandler.post {
-            try {
-                Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show()
-            } catch (_: Exception) {}
-        }
-    }
-}
