@@ -18,11 +18,13 @@ class AutoClickService : AccessibilityService() {
 
     companion object {
         var instance: AutoClickService? = null
-        private const val CHECK_INTERVAL_MS = 4000L // 每 4 秒定時巡檢
+        private const val CHECK_INTERVAL_MS = 4000L // 每 4 秒巡檢一次
 
-        // 系統安全清單：在設定與特定系統畫面不觸發點擊
+        // 系統安全清單
         private val SYSTEM_SAFE_PACKAGES = listOf(
             "settings",
+            "launcher",
+            "systemui",
             "inputmethod",
             "closer"
         )
@@ -31,10 +33,10 @@ class AutoClickService : AccessibilityService() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isServiceRunning = false
 
-    // 常規廣告關閉與快進特徵
+    // 常規廣告關閉特徵清單（已剔除容易誤判導航列的 >>, ▶▶, ⏩, >, »）
     private val CLOSE_PATTERNS = listOf(
         "✕", "×", "✖", "X", "x",
-        "⏯", "▶|", "|▶", ">>", "»", ">", "⏩",
+        "⏯", "▶|", "|▶",
         "關閉", "跳過", "關閉廣告", "跳過廣告",
         "Close", "close", "SKIP", "Skip", "skip"
     )
@@ -43,7 +45,6 @@ class AutoClickService : AccessibilityService() {
         override fun run() {
             if (!isServiceRunning) return
 
-            // 1. 每 4 秒固定提示正在運作，絕對第一執行
             showAlwaysToast("🔍 正在偵測廣告中...")
 
             try {
@@ -51,7 +52,6 @@ class AutoClickService : AccessibilityService() {
             } catch (e: Exception) {
                 e.printStackTrace()
             } finally {
-                // 閉環排程：確保 4 秒後必定再次執行
                 mainHandler.postDelayed(this, CHECK_INTERVAL_MS)
             }
         }
@@ -75,9 +75,7 @@ class AutoClickService : AccessibilityService() {
         instance = null
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // 系統事件連帶巡檢
-    }
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
 
     override fun onInterrupt() {}
 
@@ -97,7 +95,6 @@ class AutoClickService : AccessibilityService() {
 
         if (roots.isEmpty()) return
 
-        // 避免在設定頁面誤觸
         for (r in roots) {
             if (isSafeScreen(r)) return
         }
@@ -214,17 +211,29 @@ class AutoClickService : AccessibilityService() {
     }
 
     /**
-     * 精準元件掃描：
-     * 1. 文字/標籤特徵符合
-     * 2. View ID 符合
-     * 3. 針對無文字圖片叉叉（Unity Ads）：尺寸小於 180px 且位於卡片頂部角落的可點擊小元件
+     * 掃描可點擊關閉元件：
+     * - 已排除導航列右側快進區域
+     * - 文字/屬性需符合過濾後的白名單
      */
     private fun scanAndClickNodes(node: AccessibilityNodeInfo): Boolean {
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        val (screenWidth, screenHeight) = getRealScreenSize()
+
+        // 防禦排除：若元件位於頂部導航列的中右側功能區 (Y < 12% 且 X 位於 50%~85% 之間)，一律視為 App 自身按鈕排除
+        if (screenWidth > 0 && screenHeight > 0) {
+            val isInTopNavBarFunctionZone = rect.centerY() < screenHeight * 0.12f &&
+                    rect.centerX() > screenWidth * 0.50f && rect.centerX() < screenWidth * 0.85f
+            if (isInTopNavBarFunctionZone) {
+                return false
+            }
+        }
+
         val text = node.text?.toString()?.trim() ?: ""
         val desc = node.contentDescription?.toString()?.trim() ?: ""
         val viewId = node.viewIdResourceName?.lowercase() ?: ""
 
-        // 1. 文字特徵比對
+        // 1. 特徵比對（只比對跳過、關閉、X、▶| 等）
         for (pattern in CLOSE_PATTERNS) {
             if (isMatchingPattern(text, pattern) || isMatchingPattern(desc, pattern)) {
                 if (performGestureClick(node)) {
@@ -242,17 +251,14 @@ class AutoClickService : AccessibilityService() {
             }
         }
 
-        // 3. 純圖片型卡片角落叉叉精準辨識（針對 Unity Ads 圓角卡片右/左上角的無文字小按鈕）
-        val rect = Rect()
-        node.getBoundsInScreen(rect)
-        val (screenWidth, screenHeight) = getRealScreenSize()
-
+        // 3. 純圖片型 Unity Ads 卡片右上/左上角叉叉精準辨識
         if (screenWidth > 0 && screenHeight > 0) {
             val isSmallButton = rect.width() in 20..180 && rect.height() in 20..180
-            val isTopCorner = rect.top < screenHeight * 0.20f && 
-                              (rect.right > screenWidth * 0.80f || rect.left < screenWidth * 0.20f)
+            // 位於卡片邊緣極角區（避開中央功能列）
+            val isEdgeCorner = rect.top < screenHeight * 0.18f &&
+                    (rect.right > screenWidth * 0.86f || rect.left < screenWidth * 0.14f)
 
-            if (isSmallButton && isTopCorner && node.isClickable) {
+            if (isSmallButton && isEdgeCorner && node.isClickable) {
                 if (performGestureClick(node)) {
                     showAlwaysToast("⚡ 精準點擊角落關閉元件")
                     return true
