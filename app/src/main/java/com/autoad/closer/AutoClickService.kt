@@ -27,17 +27,23 @@ class AutoClickService : AccessibilityService() {
         var instance: AutoClickService? = null
         private const val CHECK_INTERVAL_MS = 3500L // 3.5 秒定時巡檢
 
-        // 系統安全清單
+        // 系統安全清單：擴充涵蓋各廠牌設定、系統UI、桌面、權限視窗，避免切換視窗與設定時誤觸
         private val SYSTEM_SAFE_PACKAGES = listOf(
             "settings",
             "inputmethod",
-            "closer"
+            "closer",
+            "systemui",
+            "launcher",
+            "permissioncontroller",
+            "packageinstaller",
+            "securitycenter"
         )
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isServiceRunning = false
     private var isActionPending = false // 防重入與冷卻標記
+    private var windowChangeTimestamp = 0L // 記錄視窗切換時間戳，防過場誤判
     private var audioManager: AudioManager? = null
     private var windowManager: WindowManager? = null
 
@@ -108,9 +114,20 @@ class AutoClickService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (isServiceRunning && !isActionPending) {
-            processScreenAction()
+        if (!isServiceRunning || isActionPending) return
+
+        // 【新增防呆】：若發生視窗/App 切換，記錄切換時間並等待 1.2 秒讓畫面完全穩定後再掃描
+        if (event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            windowChangeTimestamp = System.currentTimeMillis()
+            mainHandler.postDelayed({
+                if (isServiceRunning && !isActionPending) {
+                    processScreenAction()
+                }
+            }, 1200L)
+            return
         }
+
+        processScreenAction()
     }
 
     private fun wakeUpSystemPipeline() {
@@ -122,6 +139,11 @@ class AutoClickService : AccessibilityService() {
 
     private fun processScreenAction() {
         if (!isServiceRunning || isActionPending) return
+
+        // 【新增防呆】：視窗切換後的 1.2 秒過渡期內不執行掃描，防止在多工或跳轉動畫中誤判
+        if (System.currentTimeMillis() - windowChangeTimestamp < 1200L) {
+            return
+        }
 
         val roots = getAllWindowRoots()
         if (roots.isEmpty()) return
@@ -165,15 +187,11 @@ class AutoClickService : AccessibilityService() {
         return roots
     }
 
-    /**
-     * 處理完整快取中：加入 2.5 秒冷卻機制，防連續重複點擊兩次返回
-     */
     private fun checkAndHandleCachingScreen(root: AccessibilityNodeInfo): Boolean {
         if (!hasTextKeyword(root, "完整快取中")) {
             return false
         }
 
-        // 立即上鎖防止連點
         isActionPending = true
         showAlwaysToast("⚡ 偵測到「完整快取中」，點擊左上返回")
 
@@ -182,7 +200,6 @@ class AutoClickService : AccessibilityService() {
             clickTopLeftBackButton()
         }
 
-        // 延遲 2.5 秒冷卻解鎖，確保只點擊一次且頁面平順跳轉
         mainHandler.postDelayed({
             isActionPending = false
         }, 2500L)
@@ -264,9 +281,6 @@ class AutoClickService : AccessibilityService() {
         return false
     }
 
-    /**
-     * 掃描元件（維持漢堡選單與三點更多選項白名單排除）
-     */
     private fun scanAndClickNodes(node: AccessibilityNodeInfo): Boolean {
         val rect = Rect()
         node.getBoundsInScreen(rect)
@@ -280,7 +294,6 @@ class AutoClickService : AccessibilityService() {
             val isTopRightSpot = isTopZone && (centerXRatio in 0.75f..0.98f)
             val isTopLeftSpot = isTopZone && (centerXRatio in 0.02f..0.22f)
 
-            // 避開主頁頂部導航列中右功能區 (Y < 12%, X 在 50%~85% 之間)
             val isInTopNavBarFunctionZone = centerYRatio < 0.12f && centerXRatio in 0.50f..0.85f
 
             val text = node.text?.toString()?.trim() ?: ""
@@ -369,9 +382,6 @@ class AutoClickService : AccessibilityService() {
         return sp.getInt("click_delay_sec", 8)
     }
 
-    /**
-     * 檢查指定按鈕座標區域在當前畫面上是否依然存在有效按鈕
-     */
     private fun isTargetButtonStillPresent(targetRect: Rect): Boolean {
         val roots = getAllWindowRoots()
         for (r in roots) {
@@ -386,7 +396,6 @@ class AutoClickService : AccessibilityService() {
         val rect = Rect()
         node.getBoundsInScreen(rect)
 
-        // 判斷中心點是否依舊重疊於鎖定區域（容許 35px 微小位移）
         val isCenterMatched = Math.abs(rect.centerX() - targetRect.centerX()) < 35 &&
                               Math.abs(rect.centerY() - targetRect.centerY()) < 35
 
@@ -401,10 +410,6 @@ class AutoClickService : AccessibilityService() {
         return false
     }
 
-    /**
-     * 手勢延遲執行：
-     * 倒數期間每一秒重新驗證按鈕是否存在；若消失則即刻撤銷點擊並取消倒數！
-     */
     private fun performGestureClick(node: AccessibilityNodeInfo): Boolean {
         val rect = Rect()
         node.getBoundsInScreen(rect)
@@ -427,7 +432,6 @@ class AutoClickService : AccessibilityService() {
             if (isCompleted && isServiceRunning) {
                 dispatchClick(clickX, clickY)
             }
-            // 延遲 500ms 解鎖，防手勢送出瞬間的視窗殘影
             mainHandler.postDelayed({
                 isActionPending = false
             }, 500L)
@@ -436,9 +440,6 @@ class AutoClickService : AccessibilityService() {
         return true
     }
 
-    /**
-     * 具備每秒即時驗證能力的懸浮倒數視窗
-     */
     private fun startVerifiedCountdownOverlay(buttonRect: Rect, totalSec: Int, onFinish: (Boolean) -> Unit) {
         mainHandler.post {
             val wm = windowManager ?: run {
@@ -496,7 +497,6 @@ class AutoClickService : AccessibilityService() {
                 return@post
             }
 
-            // 每秒倒數與掃描驗證 Runnable
             val countdownRunnable = object : Runnable {
                 override fun run() {
                     if (!isServiceRunning) {
@@ -504,10 +504,8 @@ class AutoClickService : AccessibilityService() {
                         return
                     }
 
-                    // 【核心機制】：在扣減秒數前，即時複檢按鈕是否還在畫面上
                     val isStillThere = isTargetButtonStillPresent(buttonRect)
                     if (!isStillThere) {
-                        // 按鈕已不存在（提前被關閉或畫面切換），立即撤回倒數與點擊！
                         try { wm.removeView(markView) } catch (_: Exception) {}
                         showAlwaysToast("ℹ️ 廣告關閉按鈕已消失，取消點擊")
                         onFinish(false)
@@ -519,7 +517,6 @@ class AutoClickService : AccessibilityService() {
                         markView.text = "▲ 關閉！ $currentSec"
                         mainHandler.postDelayed(this, 1000L)
                     } else {
-                        // 倒數結束，執行點擊
                         try { wm.removeView(markView) } catch (_: Exception) {}
                         onFinish(true)
                     }
